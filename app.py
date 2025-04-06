@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cricket Odds API for BetBhai.io - Fixed for Render
+Cricket Odds API for BetBhai.io - Enhanced for Render with robust page refresh
 """
 
 import os
@@ -14,7 +14,7 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, BackgroundTasks, status, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse
 from pydantic import BaseModel
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
@@ -99,18 +99,24 @@ scraper_state = {
     "changes_since_last_update": 0,
     "id_mapping": {},
     "match_history": {},
+    "force_refresh": False,  # Added force_refresh flag to global state
     "lock": threading.Lock()
 }
 
 class CricketOddsScraper:
-    """Scraper for extracting cricket odds from betbhai.io - fixed for Render"""
+    """Scraper for extracting cricket odds from betbhai.io - enhanced with robust page refresh"""
     
     def __init__(self, url="https://www.betbhai.io/"):
         self.url = url
         self.driver = None
         self.error_count = 0
         self.max_continuous_errors = 10
-        self.force_refresh = False
+        self.max_extractions_before_refresh = 5  # Refresh more frequently (every 5 seconds)
+        self.page_refresh_count = 0
+        self.last_refresh_time = None
+        self.last_data_refresh_time = None
+        # Track successful extractions
+        self.successful_extractions = 0
     
     def setup_driver(self):
         """Set up the WebDriver - simplified for Render compatibility"""
@@ -131,6 +137,11 @@ class CricketOddsScraper:
             chrome_options.add_argument("--window-size=1280,720")
             chrome_options.add_argument("--disable-extensions")
             
+            # Try to reduce memory usage
+            chrome_options.add_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees")
+            chrome_options.add_argument("--disable-site-isolation-trials")
+            chrome_options.add_argument("--renderer-process-limit=1")
+            
             # Add user agent to avoid detection
             chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
             
@@ -147,12 +158,15 @@ class CricketOddsScraper:
     def navigate_to_site(self):
         """Navigate to the website and wait for it to load"""
         try:
+            start_time = time.time()
             self.driver.get(self.url)
             # Wait for the page to load
             WebDriverWait(self.driver, 20).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, ".inplay-item-list"))
             )
-            logger.info("Successfully navigated to the website")
+            end_time = time.time()
+            self.last_refresh_time = datetime.now()
+            logger.info(f"Successfully navigated to the website in {end_time - start_time:.2f} seconds")
             return True
         except Exception as e:
             logger.error(f"Error navigating to site: {str(e)}")
@@ -189,23 +203,36 @@ class CricketOddsScraper:
             
             for section in cricket_sections:
                 try:
-                    # Check if this is the cricket section by looking for the text or icon
-                    # FIXED: Use a more compatible approach to identify cricket section
-                    header_content = section.find_element(By.CSS_SELECTOR, '.inplay-item-list__header-content')
-                    header_text = header_content.text.lower()
+                    # ENHANCED: More robust section finding
+                    header_content = None
+                    try:
+                        header_content = section.find_element(By.CSS_SELECTOR, '.inplay-item-list__header-content')
+                    except NoSuchElementException:
+                        # Skip if there's no header content
+                        continue
+
+                    is_cricket_section = False
                     
-                    # Check if header contains "cricket" text
-                    if 'cricket' not in header_text:
-                        # Also try to find cricket icon
+                    # Check in text
+                    header_text = header_content.text.lower()
+                    if 'cricket' in header_text:
+                        is_cricket_section = True
+                    
+                    # Also check for cricket icon
+                    if not is_cricket_section:
                         try:
                             cricket_icons = section.find_elements(By.CSS_SELECTOR, '.inplay-content__logo-icon--cricket')
-                            if not cricket_icons:
-                                continue  # Not a cricket section
+                            if cricket_icons:
+                                is_cricket_section = True
                         except:
-                            continue  # Not a cricket section
+                            pass
+                    
+                    if not is_cricket_section:
+                        continue
                     
                     # Get all match items in this section
                     match_items = section.find_elements(By.CSS_SELECTOR, '.inplay-item')
+                    logger.info(f"Found {len(match_items)} cricket matches in section")
                     
                     for item in match_items:
                         try:
@@ -284,6 +311,8 @@ class CricketOddsScraper:
             if matches:
                 logger.info(f"Extracted {len(matches)} cricket matches")
                 self.error_count = 0
+                self.successful_extractions += 1
+                self.last_data_refresh_time = datetime.now()
             else:
                 logger.warning("No cricket matches found")
                 self.error_count += 1
@@ -309,11 +338,56 @@ class CricketOddsScraper:
                     'matches': new_matches
                 }
                 
-                # Simple change detection
-                old_count = len(scraper_state["data"].get("matches", []))
-                new_count = len(new_matches)
-                if old_count != new_count:
-                    changes_made = abs(old_count - new_count)
+                # Better change detection - compare match by match
+                old_matches = scraper_state["data"].get("matches", [])
+                
+                # Build a map of old matches by ID
+                old_matches_by_id = {m.get('id'): m for m in old_matches}
+                
+                # Compare each new match with old match
+                for new_match in new_matches:
+                    match_id = new_match.get('id')
+                    
+                    # If match not in old data, it's new
+                    if match_id not in old_matches_by_id:
+                        changes_made += 1
+                        continue
+                    
+                    # If match exists, check for changes in odds
+                    old_match = old_matches_by_id[match_id]
+                    
+                    # Compare odds - simple version just looking at prices
+                    old_odds = old_match.get('odds', {})
+                    new_odds = new_match.get('odds', {})
+                    
+                    # Compare back odds
+                    old_back = old_odds.get('back', [])
+                    new_back = new_odds.get('back', [])
+                    
+                    if len(old_back) != len(new_back):
+                        changes_made += 1
+                        continue
+                    
+                    for i in range(len(old_back)):
+                        if i < len(old_back) and i < len(new_back):
+                            if old_back[i].get('price') != new_back[i].get('price'):
+                                changes_made += 1
+                                break
+                    
+                    # Compare lay odds if no changes in back odds
+                    if changes_made == 0:
+                        old_lay = old_odds.get('lay', [])
+                        new_lay = new_odds.get('lay', [])
+                        
+                        if len(old_lay) != len(new_lay):
+                            changes_made += 1
+                            continue
+                        
+                        for i in range(len(old_lay)):
+                            if i < len(old_lay) and i < len(new_lay):
+                                if old_lay[i].get('price') != new_lay[i].get('price'):
+                                    changes_made += 1
+                                    break
                 
                 # Update global state
                 scraper_state["data"] = output_data
@@ -321,14 +395,17 @@ class CricketOddsScraper:
                 scraper_state["status"] = "running"
                 scraper_state["changes_since_last_update"] = changes_made
                 
-                # Save data to file periodically (every 30 seconds)
+                # Save data to file periodically (every 15 seconds) or if changes
                 last_saved = getattr(self, 'last_saved', None)
                 now = datetime.now()
-                if last_saved is None or (now - last_saved).total_seconds() > 30:
+                if (last_saved is None or 
+                    (now - last_saved).total_seconds() > 15 or
+                    changes_made > 0):
                     self._save_data_files(output_data)
                     self.last_saved = now
                 
-                logger.info(f"Data updated with {len(new_matches)} matches")
+                if changes_made > 0:
+                    logger.info(f"Data updated with {changes_made} changes in {len(new_matches)} matches")
                 return True
         except Exception as e:
             logger.error(f"Error updating global state: {str(e)}")
@@ -348,8 +425,45 @@ class CricketOddsScraper:
             logger.error(f"Error saving data file: {str(e)}")
             return False
     
+    def _perform_page_refresh(self):
+        """Perform a page refresh with different strategies"""
+        self.page_refresh_count += 1
+        logger.info(f"Performing page refresh ({self.page_refresh_count})")
+        
+        # Every 3rd refresh, do a complete driver refresh
+        if self.page_refresh_count >= 3:
+            logger.info("Performing complete driver reset")
+            success = self.setup_driver() and self.navigate_to_site()
+            if success:
+                logger.info("Complete driver reset successful")
+                self.page_refresh_count = 0
+                return True
+            else:
+                logger.error("Complete driver reset failed")
+                return False
+                
+        # Try JavaScript refresh first (lighter weight)
+        try:
+            logger.info("Performing JavaScript refresh")
+            self.driver.execute_script("location.reload(true);")
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".inplay-item-list"))
+            )
+            logger.info("JavaScript refresh successful")
+            return True
+        except Exception as e:
+            logger.warning(f"JavaScript refresh failed: {str(e)}")
+            
+        # If JS refresh fails, try full navigation
+        try:
+            logger.info("Falling back to full page navigation")
+            return self.navigate_to_site()
+        except Exception as e:
+            logger.error(f"Full page navigation failed: {str(e)}")
+            return False
+    
     def run(self, interval=1):
-        """Run the scraper every 'interval' seconds"""
+        """Run the scraper every 'interval' seconds with enhanced refresh logic"""
         with scraper_state["lock"]:
             scraper_state["is_running"] = True
             scraper_state["start_time"] = datetime.now()
@@ -367,11 +481,13 @@ class CricketOddsScraper:
         try:
             # Navigate to the site initially
             if not self.navigate_to_site():
-                logger.error("Failed to navigate to the website. Exiting.")
-                with scraper_state["lock"]:
-                    scraper_state["is_running"] = False
-                    scraper_state["status"] = "failed"
-                return
+                logger.error("Failed to navigate to the website. Retrying...")
+                if not self.setup_driver() or not self.navigate_to_site():
+                    logger.error("Navigation failed after retry. Exiting.")
+                    with scraper_state["lock"]:
+                        scraper_state["is_running"] = False
+                        scraper_state["status"] = "failed"
+                    return
             
             # Update status to running
             with scraper_state["lock"]:
@@ -383,19 +499,49 @@ class CricketOddsScraper:
                 try:
                     start_time = time.time()
                     
+                    # Check for force refresh flag
+                    force_refresh = False
+                    with scraper_state["lock"]:
+                        force_refresh = scraper_state.get("force_refresh", False)
+                        if force_refresh:
+                            scraper_state["force_refresh"] = False
+                    
+                    # Check if we need to refresh
+                    need_refresh = (
+                        force_refresh or 
+                        refresh_count >= self.max_extractions_before_refresh or
+                        (self.last_data_refresh_time and 
+                         (datetime.now() - self.last_data_refresh_time).total_seconds() > 30)
+                    )
+                    
+                    if need_refresh:
+                        logger.info(f"Page refresh needed (force={force_refresh}, count={refresh_count})")
+                        if self._perform_page_refresh():
+                            refresh_count = 0
+                        else:
+                            # If refresh failed, wait a bit and increment error count
+                            logger.error("Page refresh failed")
+                            self.error_count += 1
+                            time.sleep(5)
+                    
                     # Extract and update data
                     matches = self.extract_cricket_odds()
                     if matches:
                         self.update_global_state(matches)
                     
-                    # Refresh page every 10 iterations
                     refresh_count += 1
-                    if refresh_count >= 10:
-                        logger.info("Refreshing page")
-                        self.navigate_to_site()
-                        refresh_count = 0
                     
-                    # Update error count
+                    # Check for too many errors
+                    if self.error_count > self.max_continuous_errors:
+                        logger.warning(f"Too many errors ({self.error_count}), resetting driver")
+                        if not self.setup_driver() or not self.navigate_to_site():
+                            logger.error("Driver reset failed, waiting before retry")
+                            time.sleep(15)  # Wait longer
+                        else:
+                            self.error_count = 0
+                            refresh_count = 0
+                    
+                    # Update error count in global state
                     with scraper_state["lock"]:
                         scraper_state["error_count"] = self.error_count
                     
@@ -408,14 +554,7 @@ class CricketOddsScraper:
                 except Exception as e:
                     logger.error(f"Error in scraper loop: {str(e)}")
                     time.sleep(5)  # Wait before retrying
-                    
-                    # Check if we need to reset the driver
-                    if self.error_count > self.max_continuous_errors:
-                        logger.warning("Too many errors, resetting driver")
-                        if not self.setup_driver() or not self.navigate_to_site():
-                            logger.error("Driver reset failed")
-                        else:
-                            self.error_count = 0
+                    self.error_count += 1
                 
         except Exception as e:
             logger.error(f"Unexpected error in scraper: {str(e)}")
@@ -444,10 +583,43 @@ def start_scraper_thread():
 
 # API Endpoints - FIXED to ensure routing works correctly
 
-@app.get("/", tags=["Root"], include_in_schema=True)
+@app.get("/", response_class=HTMLResponse, include_in_schema=True)
 async def root():
-    """Root endpoint with API information"""
-    # This is the fixed root endpoint that will handle GET /
+    """Root endpoint with API information as HTML page"""
+    # Return an HTML page for the root - this helps with debugging 404 issues
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Cricket Odds API</title>
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+            h1 { color: #333; }
+            ul { list-style-type: none; padding: 0; }
+            li { margin-bottom: 10px; padding: 8px; background-color: #f5f5f5; border-radius: 4px; }
+            a { color: #0066cc; text-decoration: none; }
+            a:hover { text-decoration: underline; }
+        </style>
+    </head>
+    <body>
+        <h1>Cricket Odds API</h1>
+        <p>Version: 2.0.1</p>
+        <p>Real-time cricket odds from betbhai.io</p>
+        
+        <h2>Available Endpoints:</h2>
+        <ul>
+            <li><a href="/matches">/matches</a> - Get all cricket matches</li>
+            <li>/matches/{match_id} - Get a specific match by ID</li>
+            <li><a href="/status">/status</a> - Get the scraper status</li>
+            <li>/refresh (POST) - Force a refresh of the data</li>
+        </ul>
+    </body>
+    </html>
+    """
+
+@app.get("/api", tags=["API"])
+async def api_info():
+    """API information endpoint"""
     return {
         "name": "Cricket Odds API",
         "version": "2.0.1",
