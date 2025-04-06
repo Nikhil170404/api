@@ -132,7 +132,7 @@ class CricketOddsScraper:
         self.force_refresh = False
     
     def setup_driver(self):
-        """Set up the Selenium WebDriver with compatibility for Render deployment"""
+        """Set up the Selenium WebDriver with fallback options"""
         try:
             # Close existing driver if any
             if self.driver:
@@ -152,31 +152,35 @@ class CricketOddsScraper:
             # Add user agent to avoid detection
             chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
             
-            # Adjust for Render deployment
-            if IS_PRODUCTION:
-                logger.info("Setting up driver for production environment")
-                # Use system chrome binary on Render
-                chrome_options.binary_location = "/opt/render/chrome/chrome"
-                
-                # Initialize the WebDriver without ChromeDriverManager
-                service = Service('/opt/render/chromedriver/chromedriver')
+            # Try to create WebDriver with direct ChromeDriver path
+            try:
+                logger.info("Trying with direct ChromeDriver path")
+                service = Service(executable_path="/usr/local/bin/chromedriver")
                 self.driver = webdriver.Chrome(service=service, options=chrome_options)
-            else:
-                # For local development, use ChromeDriverManager
-                try:
-                    from webdriver_manager.chrome import ChromeDriverManager
-                    service = Service(ChromeDriverManager().install())
-                    self.driver = webdriver.Chrome(service=service, options=chrome_options)
-                except Exception as e:
-                    logger.error(f"Error with ChromeDriverManager: {e}")
-                    # Fallback to direct ChromeDriver if available
-                    service = Service()
-                    self.driver = webdriver.Chrome(service=service, options=chrome_options)
+                logger.info("Successfully created WebDriver with direct path")
+                self.retry_count = 0
+                return True
+            except Exception as e:
+                logger.error(f"Direct path attempt failed: {e}")
             
-            self.driver.set_page_load_timeout(30)
-            logger.info("WebDriver initialized successfully")
-            self.retry_count = 0
-            return True
+            # Try with default system-wide ChromeDriver
+            try:
+                logger.info("Trying with system-wide ChromeDriver")
+                self.driver = webdriver.Chrome(options=chrome_options)
+                logger.info("Successfully created WebDriver with system-wide ChromeDriver")
+                self.retry_count = 0
+                return True
+            except Exception as e:
+                logger.error(f"System-wide ChromeDriver attempt failed: {e}")
+            
+            # All attempts failed
+            self.retry_count += 1
+            self.error_count += 1
+            if self.retry_count < self.max_retries:
+                logger.info(f"Retrying driver setup (attempt {self.retry_count}/{self.max_retries})...")
+                time.sleep(5)
+                return self.setup_driver()
+            return False
         except Exception as e:
             logger.error(f"Error initializing WebDriver: {e}")
             self.retry_count += 1
