@@ -1,51 +1,31 @@
 #!/bin/bash
+# Enhanced startup script for free Render deployment
+
 # Create required directories
 mkdir -p data
-mkdir -p match_logs
-mkdir -p debug_html
+mkdir -p logs
 
-# Set environment variable for Render detection
-export RENDER=true
-
-# Install Chrome directly in the start script to ensure it's available
-echo "Installing Chrome..."
-apt-get update
-apt-get install -y wget gnupg
-wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add -
-echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list
-apt-get update
-apt-get install -y google-chrome-stable
-
-# Verify Chrome installation
-echo "Chrome version:"
-google-chrome --version
-
-# Manually download and set up ChromeDriver
-echo "Setting up ChromeDriver..."
-CHROME_VERSION=$(google-chrome --version | awk '{print $3}' | cut -d. -f1)
-CHROMEDRIVER_VERSION=$(curl -s "https://chromedriver.storage.googleapis.com/LATEST_RELEASE_$CHROME_VERSION")
-wget -q "https://chromedriver.storage.googleapis.com/$CHROMEDRIVER_VERSION/chromedriver_linux64.zip"
-unzip chromedriver_linux64.zip
-chmod +x chromedriver
-mv chromedriver /usr/local/bin/
-echo "ChromeDriver installed at: $(which chromedriver)"
-echo "ChromeDriver version: $(chromedriver --version)"
-
-# Set environment variables for better performance
+# Set environment variables for performance tuning
 export PYTHONUNBUFFERED=1
-export CHROME_BIN=/usr/bin/google-chrome
-export CHROME_PATH=/usr/bin/google-chrome
-export WEB_CONCURRENCY=1  # Ensure only one worker to avoid multiple scrapers
+export WEB_CONCURRENCY=1  # Single worker process for consistency
+export MAX_CLIENTS_PER_MINUTE=2000  # Higher limit for production
+export SCRAPE_INTERVAL=1  # Keep 1-second scraping interval
 
-# Increase system limits for Chrome
-echo "Increasing system limits for Chrome"
-ulimit -n 4096
+# Configure memory settings for better performance
+export PYTHONMALLOC=malloc
+export MALLOC_ARENA_MAX=2  # Limit memory fragmentation
 
-# Configure Chrome for better stability in containerized environments
-echo "Configuring Chrome for container environment"
-mkdir -p /tmp/chrome-user-data
-chmod 777 /tmp/chrome-user-data
+# System tuning for render
+ulimit -n 4096  # Increase file descriptor limit
+echo "Setting system limits for high concurrency"
 
-# Start the application with proper logging and extended timeouts
-echo "Starting application on port $PORT"
-exec uvicorn app:app --host 0.0.0.0 --port $PORT --timeout-keep-alive 300 --log-level info
+# Install required packages directly (in case requirements.txt is not used)
+pip install fastapi uvicorn aiohttp beautifulsoup4 cachetools
+
+# Log startup details
+echo "Starting Cricket Odds API on port $PORT"
+echo "Memory optimization enabled"
+echo "Rate limiting set to $MAX_CLIENTS_PER_MINUTE requests per minute"
+
+# Start the application with proper settings for high concurrency
+exec uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1 --loop uvloop --http httptools --log-level info --timeout-keep-alive 75
