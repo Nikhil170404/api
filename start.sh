@@ -1,7 +1,8 @@
 #!/bin/bash
-
-# Create data directory
+# Create required directories
 mkdir -p data
+mkdir -p match_logs
+mkdir -p debug_html
 
 # Set environment variable for Render detection
 export RENDER=true
@@ -30,6 +31,21 @@ mv chromedriver /usr/local/bin/
 echo "ChromeDriver installed at: $(which chromedriver)"
 echo "ChromeDriver version: $(chromedriver --version)"
 
-# Start the FastAPI app
+# Set environment variables for better performance
+export PYTHONUNBUFFERED=1
+export CHROME_BIN=/usr/bin/google-chrome
+export CHROME_PATH=/usr/bin/google-chrome
+export WEB_CONCURRENCY=1  # Ensure only one worker to avoid multiple scrapers
+
+# Increase system limits for Chrome
+echo "Increasing system limits for Chrome"
+ulimit -n 4096
+
+# Configure Chrome for better stability in containerized environments
+echo "Configuring Chrome for container environment"
+mkdir -p /tmp/chrome-user-data
+chmod 777 /tmp/chrome-user-data
+
+# Start the application with proper logging and extended timeouts
 echo "Starting application on port $PORT"
-uvicorn app:app --host 0.0.0.0 --port $PORT
+exec uvicorn app:app --host 0.0.0.0 --port $PORT --timeout-keep-alive 300 --log-level info
