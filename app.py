@@ -180,17 +180,30 @@ class CricketOddsScraper:
         return match_key
     
     def extract_cricket_odds(self):
-        """Extract cricket odds data from the loaded page - fixed invalid selector"""
+        """Extract cricket odds data from the loaded page with improved data refresh"""
         matches = []
         
         try:
-            # Find cricket sections - FIXED: don't use :contains() selector which is invalid
+            # Wait for dynamic content to load/update
+            try:
+                # Create a wait object with a short timeout to capture updates
+                wait = WebDriverWait(self.driver, 2)
+                
+                # Wait for any odds updates (price changes)
+                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, '.odd-button__price')))
+                
+                # Optionally refresh DOM content without reloading page
+                self.driver.execute_script("return document.body.innerHTML;")
+            except TimeoutException:
+                # Don't treat this as an error, it might just mean no updates available
+                pass
+                
+            # Find cricket sections
             cricket_sections = self.driver.find_elements(By.CSS_SELECTOR, 'ion-list.inplay-item-list')
             
             for section in cricket_sections:
                 try:
                     # Check if this is the cricket section by looking for the text or icon
-                    # FIXED: Use a more compatible approach to identify cricket section
                     header_content = section.find_element(By.CSS_SELECTOR, '.inplay-item-list__header-content')
                     header_text = header_content.text.lower()
                     
@@ -209,10 +222,16 @@ class CricketOddsScraper:
                     
                     for item in match_items:
                         try:
-                            # Extract team names
-                            player_elems = item.find_elements(By.CSS_SELECTOR, '.inplay-item__player span')
-                            team1 = player_elems[0].text if len(player_elems) >= 1 else ""
-                            team2 = player_elems[1].text if len(player_elems) > 1 else ""
+                            # Use StaleElementReferenceException handling to get fresh data
+                            try:
+                                # Extract team names
+                                player_elems = item.find_elements(By.CSS_SELECTOR, '.inplay-item__player span')
+                                team1 = player_elems[0].text if len(player_elems) >= 1 else ""
+                                team2 = player_elems[1].text if len(player_elems) > 1 else ""
+                            except StaleElementReferenceException:
+                                # Element became stale, retry with fresh reference
+                                logger.debug("Stale element encountered, refreshing reference")
+                                continue
 
                             # Create a stable ID
                             stable_id = self._create_stable_id(team1, team2)
@@ -243,34 +262,42 @@ class CricketOddsScraper:
                             else:
                                 match_data['in_play'] = False
                             
-                            # Extract odds
+                            # Extract odds with improved handling of dynamic updates
                             odds = {'back': [], 'lay': []}
                             
                             # Back odds
                             back_buttons = item.find_elements(By.CSS_SELECTOR, '.odd-button.back-color')
                             for i, button in enumerate(back_buttons):
-                                price_elem = button.find_elements(By.CSS_SELECTOR, '.odd-button__price')
-                                volume_elem = button.find_elements(By.CSS_SELECTOR, '.odd-button__volume')
-                                
-                                if price_elem and price_elem[0].text and price_elem[0].text != '-':
-                                    odds['back'].append({
-                                        'position': i,
-                                        'price': price_elem[0].text,
-                                        'volume': volume_elem[0].text if volume_elem else None
-                                    })
+                                try:
+                                    price_elem = button.find_elements(By.CSS_SELECTOR, '.odd-button__price')
+                                    volume_elem = button.find_elements(By.CSS_SELECTOR, '.odd-button__volume')
+                                    
+                                    if price_elem and price_elem[0].text and price_elem[0].text != '-':
+                                        odds['back'].append({
+                                            'position': i,
+                                            'price': price_elem[0].text,
+                                            'volume': volume_elem[0].text if volume_elem else None
+                                        })
+                                except StaleElementReferenceException:
+                                    # Skip this button if it became stale
+                                    continue
                             
                             # Lay odds
                             lay_buttons = item.find_elements(By.CSS_SELECTOR, '.odd-button.lay-color')
                             for i, button in enumerate(lay_buttons):
-                                price_elem = button.find_elements(By.CSS_SELECTOR, '.odd-button__price')
-                                volume_elem = button.find_elements(By.CSS_SELECTOR, '.odd-button__volume')
-                                
-                                if price_elem and price_elem[0].text and price_elem[0].text != '-':
-                                    odds['lay'].append({
-                                        'position': i,
-                                        'price': price_elem[0].text,
-                                        'volume': volume_elem[0].text if volume_elem else None
-                                    })
+                                try:
+                                    price_elem = button.find_elements(By.CSS_SELECTOR, '.odd-button__price')
+                                    volume_elem = button.find_elements(By.CSS_SELECTOR, '.odd-button__volume')
+                                    
+                                    if price_elem and price_elem[0].text and price_elem[0].text != '-':
+                                        odds['lay'].append({
+                                            'position': i,
+                                            'price': price_elem[0].text,
+                                            'volume': volume_elem[0].text if volume_elem else None
+                                        })
+                                except StaleElementReferenceException:
+                                    # Skip this button if it became stale
+                                    continue
                             
                             match_data['odds'] = odds
                             matches.append(match_data)
@@ -377,8 +404,6 @@ class CricketOddsScraper:
             with scraper_state["lock"]:
                 scraper_state["status"] = "running"
             
-            refresh_count = 0
-            
             while scraper_state["is_running"]:
                 try:
                     start_time = time.time()
@@ -387,13 +412,6 @@ class CricketOddsScraper:
                     matches = self.extract_cricket_odds()
                     if matches:
                         self.update_global_state(matches)
-                    
-                    # Refresh page every 10 iterations
-                    refresh_count += 1
-                    if refresh_count >= 10:
-                        logger.info("Refreshing page")
-                        self.navigate_to_site()
-                        refresh_count = 0
                     
                     # Update error count
                     with scraper_state["lock"]:
