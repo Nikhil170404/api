@@ -7,4 +7,4 @@ requests==2.31.0
 beautifulsoup4==4.12.2
 pytz==2023.3.post1
 aiofiles==23.2.1
-webdriver-manager==4.0.0#!/bin/bash
+webdriver-manager==4.0.0
