@@ -16,6 +16,7 @@ import uvicorn
 import asyncio
 import sys
 import subprocess
+import random
 from typing import List, Dict, Any, Optional, Union
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status, Query, Request
@@ -163,7 +164,7 @@ except Exception as e:
 class CricketOddsScraper:
     """Scraper for extracting cricket odds from 1xbet"""
     
-    def __init__(self, url="https://ind.1xbet.com/"):
+    def __init__(self, url="https://ind.1xbet.com/live/cricket"):
         self.url = url
         self.driver = None
         self.retry_count = 0
@@ -175,7 +176,24 @@ class CricketOddsScraper:
         self.playwright = None
         self.browser = None
         self.page = None
-        self.navigation_timeout = int(os.environ.get('SELENIUM_TIMEOUT', 30))
+        self.navigation_timeout = int(os.environ.get('SELENIUM_TIMEOUT', 120))
+        
+        # Set of user agents to rotate
+        self.user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0"
+        ]
+        
+        # Try to import fake-useragent for better randomization
+        try:
+            from fake_useragent import UserAgent
+            self.ua = UserAgent()
+            self.has_fake_ua = True
+        except ImportError:
+            self.has_fake_ua = False
     
     def setup_driver(self):
         """Set up the browser driver with fallback options"""
@@ -192,6 +210,14 @@ class CricketOddsScraper:
                 except:
                     pass
             
+            # Get a random user agent
+            if self.has_fake_ua:
+                user_agent = self.ua.random
+            else:
+                user_agent = random.choice(self.user_agents)
+                
+            logger.info(f"Using user agent: {user_agent}")
+            
             # Configure Chrome options
             chrome_options = Options()
             chrome_options.add_argument("--headless=new")  # Use new headless mode
@@ -205,8 +231,12 @@ class CricketOddsScraper:
             chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
             chrome_options.add_experimental_option("useAutomationExtension", False)
             
-            # Add user agent to avoid detection
-            chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+            # Add language and geolocation
+            chrome_options.add_argument("--lang=en-US,en;q=0.9")
+            chrome_options.add_argument("--accept-lang=en-US,en;q=0.9")
+            
+            # Add user agent
+            chrome_options.add_argument(f"user-agent={user_agent}")
             
             # Try with WebDriver Manager if available
             if WEBDRIVER_MANAGER_AVAILABLE:
@@ -215,6 +245,9 @@ class CricketOddsScraper:
                     self.driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
                     logger.info("Successfully created WebDriver with webdriver-manager")
                     self.retry_count = 0
+                    
+                    # Execute CDP commands to disable automation flags
+                    self._disable_automation_flags()
                     return True
                 except Exception as e:
                     logger.error(f"Webdriver-manager setup failed: {e}")
@@ -225,6 +258,9 @@ class CricketOddsScraper:
                 self.driver = webdriver.Chrome(options=chrome_options)
                 logger.info("Successfully created WebDriver with system Chrome")
                 self.retry_count = 0
+                
+                # Execute CDP commands to disable automation flags
+                self._disable_automation_flags()
                 return True
             except Exception as e:
                 logger.error(f"System Chrome attempt failed: {e}")
@@ -261,7 +297,78 @@ class CricketOddsScraper:
                 return self.setup_driver()
             
             return False
-    
+            
+    def _disable_automation_flags(self):
+        """Disable automation flags in Chrome for better stealth"""
+        if not self.driver:
+            return
+            
+        try:
+            # Execute CDP commands to disable automation flags
+            self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                'source': '''
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en']
+                });
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5]
+                });
+                
+                // Overwrite the `plugins` property to use a custom getter.
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => {
+                        // This just needs to have `length > 0`, but we could mock the plugins too
+                        return [1, 2, 3, 4, 5];
+                    },
+                });
+                
+                // Spoof languages
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en'],
+                });
+                
+                // Spoof user agent
+                window.chrome = {
+                    runtime: {},
+                };
+                
+                // Pass the Permissions Test
+                Object.defineProperty(navigator, 'permissions', {
+                    get: () => ({
+                        query: () => Promise.resolve({ state: 'granted' }),
+                    }),
+                });
+                
+                // Spoof platform
+                Object.defineProperty(navigator, 'platform', {
+                    get: () => 'Win32',
+                });
+                
+                // Spoof hardwareConcurrency
+                Object.defineProperty(navigator, 'hardwareConcurrency', {
+                    get: () => 8,
+                });
+                
+                // Spoof deviceMemory
+                Object.defineProperty(navigator, 'deviceMemory', {
+                    get: () => 8,
+                });
+                '''
+            })
+            
+            # Apply additional CDP commands to spoof geo coordinates
+            self.driver.execute_cdp_cmd("Emulation.setGeolocationOverride", {
+                "latitude": 28.6139,  # Delhi, India coordinates 
+                "longitude": 77.2090,
+                "accuracy": 100
+            })
+            
+        except Exception as e:
+            logger.warning(f"Failed to disable automation flags: {e}")
+            
     def _setup_playwright(self):
         """Set up Playwright as an alternative to Selenium"""
         if not PLAYWRIGHT_AVAILABLE:
@@ -283,20 +390,94 @@ class CricketOddsScraper:
                 except:
                     pass
             
+            # Get a random user agent
+            if self.has_fake_ua:
+                user_agent = self.ua.random
+            else:
+                user_agent = random.choice(self.user_agents)
+                
+            logger.info(f"Using Playwright user agent: {user_agent}")
+            
             # Start new playwright instance
             self.playwright = sync_playwright().start()
+            
+            # Create a browser context with specific options for stealth
             self.browser = self.playwright.chromium.launch(
                 headless=True,
                 args=[
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
+                    "--disable-web-security",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--disable-site-isolation-trials",
                 ]
             )
-            self.page = self.browser.new_page(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-                viewport={"width": 1920, "height": 1080}
+            
+            # Create a context with specific options
+            context = self.browser.new_context(
+                user_agent=user_agent,
+                viewport={"width": 1920, "height": 1080},
+                locale="en-US",
+                timezone_id="Asia/Kolkata",  # Set to India timezone
+                geolocation={"latitude": 28.6139, "longitude": 77.2090},  # Delhi, India
+                permissions=["geolocation"],
+                java_script_enabled=True,
+                bypass_csp=True,
+                extra_http_headers={
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+                    "sec-ch-ua": '"Chromium";v="123", "Google Chrome";v="123", "Not;A=Brand";v="99"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"Windows"',
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Sec-Fetch-User": "?1",
+                    "Upgrade-Insecure-Requests": "1"
+                }
             )
+            
+            # Create a new page from the context
+            self.page = context.new_page()
+            
+            # Add script to page to evade detection
+            self.page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+                
+                window.chrome = {
+                    runtime: {},
+                };
+                
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [
+                        {
+                            0: {type: "application/x-google-chrome-pdf", suffixes: "pdf", description: "Portable Document Format", enabledPlugin: true},
+                            description: "Portable Document Format",
+                            filename: "internal-pdf-viewer",
+                            length: 1,
+                            name: "Chrome PDF Plugin"
+                        },
+                        {
+                            0: {type: "application/pdf", suffixes: "pdf", description: "Portable Document Format", enabledPlugin: true},
+                            description: "Portable Document Format",
+                            filename: "mhjfbmdgcfjbbpaeojofohoefgiehjai",
+                            length: 1,
+                            name: "Chrome PDF Viewer"
+                        },
+                        {
+                            0: {type: "application/x-nacl", suffixes: "", description: "Native Client Executable", enabledPlugin: true},
+                            1: {type: "application/x-pnacl", suffixes: "", description: "Portable Native Client Executable", enabledPlugin: true},
+                            description: "Native Client",
+                            filename: "internal-nacl-plugin",
+                            length: 2,
+                            name: "Native Client"
+                        }
+                    ]
+                });
+            """)
             
             # Set flag to use Playwright for all subsequent operations
             self.use_playwright = True
@@ -326,14 +507,18 @@ class CricketOddsScraper:
     def _navigate_with_selenium(self):
         """Navigate using Selenium WebDriver"""
         try:
-            # Add stealth mode behaviors
-            self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-                'source': '''
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined
-                })
-                '''
-            })
+            # Add stealth mode behaviors first
+            self._disable_automation_flags()
+            
+            logger.info(f"Navigating to {self.url} with Selenium")
+            
+            # First try to visit the main page to set cookies
+            try:
+                logger.info("First visiting main page to set cookies")
+                self.driver.get("https://ind.1xbet.com/")
+                time.sleep(5)  # Give some time for cookies to be set
+            except Exception as e:
+                logger.warning(f"Failed to visit main page first: {e}")
             
             # Navigate to site with extended timeout
             self.driver.set_page_load_timeout(self.navigation_timeout)
@@ -344,32 +529,57 @@ class CricketOddsScraper:
                 WebDriverWait(self.driver, self.navigation_timeout).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, ".dashboard-champ-content"))
                 )
-                logger.info("Successfully navigated to the website with Selenium")
+                logger.info("Found .dashboard-champ-content with Selenium")
                 return True
             except TimeoutException:
-                # Try checking if we're being blocked (might redirect to captcha)
-                if "captcha" in self.driver.page_source.lower() or "1xbet" not in self.driver.page_source.lower():
-                    logger.error("Possible bot detection or blocking. Page doesn't contain expected content.")
-                    
-                    # Debug: Save HTML
+                # Try different selectors
+                try:
+                    WebDriverWait(self.driver, 10).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, ".c-events__item_head"))
+                    )
+                    logger.info("Found .c-events__item_head with Selenium")
+                    return True
+                except TimeoutException:
                     try:
-                        with open("debug_html/blocked_page.html", "w", encoding="utf-8") as f:
-                            f.write(self.driver.page_source)
-                        logger.info("Saved blocked page HTML for debugging")
-                    except Exception as e:
-                        logger.error(f"Failed to save debug HTML: {e}")
-                    
-                    # Fall back to Playwright if available
-                    if PLAYWRIGHT_AVAILABLE and not self.use_playwright:
-                        logger.info("Trying Playwright after possible blocking")
-                        self.use_playwright = True
-                        if self._setup_playwright():
-                            return self._navigate_with_playwright()
-                    
-                    return False
+                        WebDriverWait(self.driver, 5).until(
+                            EC.presence_of_element_located((By.CSS_SELECTOR, ".c-events__team"))
+                        )
+                        logger.info("Found .c-events__team with Selenium")
+                        return True
+                    except TimeoutException:
+                        pass
                 
-                logger.error("Timeout while loading the website with Selenium")
-                self.error_count += 1
+                # Check if we're being blocked (might redirect to captcha)
+                page_text = self.driver.page_source.lower()
+                if "captcha" in page_text or "robot" in page_text or "human" in page_text:
+                    logger.error("Possible captcha or bot detection detected")
+                elif "1xbet" not in page_text:
+                    logger.error("Page doesn't contain expected 1xbet content")
+                else:
+                    logger.info("Page contains 1xbet content but not cricket section selectors")
+                    # Just try to return true and proceed if we at least got to 1xbet
+                    return True
+                    
+                # Debug: Save HTML
+                try:
+                    os.makedirs("debug_html", exist_ok=True)
+                    with open("debug_html/blocked_page.html", "w", encoding="utf-8") as f:
+                        f.write(self.driver.page_source)
+                    logger.info("Saved blocked page HTML for debugging")
+                    
+                    # Also save a screenshot
+                    self.driver.save_screenshot("debug_html/blocked_page.png")
+                    logger.info("Saved screenshot for debugging")
+                except Exception as e:
+                    logger.error(f"Failed to save debug HTML: {e}")
+                
+                # Fall back to Playwright if available
+                if PLAYWRIGHT_AVAILABLE and not self.use_playwright:
+                    logger.info("Trying Playwright after possible blocking")
+                    self.use_playwright = True
+                    if self._setup_playwright():
+                        return self._navigate_with_playwright()
+                
                 return False
         except WebDriverException as e:
             logger.error(f"WebDriver error while navigating: {e}")
@@ -386,36 +596,64 @@ class CricketOddsScraper:
             # Navigate with Playwright
             logger.info(f"Navigating to {self.url} with Playwright")
             
-            # Set longer timeout for navigation
-            playwright_timeout = int(os.environ.get('PLAYWRIGHT_TIMEOUT', 60)) * 1000  # Convert to ms
+            # First try to visit the main page to set cookies
+            try:
+                logger.info("First visiting main page to set cookies with Playwright")
+                self.page.goto("https://ind.1xbet.com/", wait_until="domcontentloaded")
+                self.page.wait_for_timeout(5000)  # Wait 5 seconds for cookies to be set
+            except Exception as e:
+                logger.warning(f"Failed to visit main page first with Playwright: {e}")
             
-            # Go to the URL with extended timeout
-            self.page.goto(self.url, timeout=playwright_timeout)
+            # Set longer timeout for navigation
+            playwright_timeout = int(os.environ.get('PLAYWRIGHT_TIMEOUT', 120)) * 1000  # Convert to ms
+            
+            # Go to the cricket URL
+            self.page.goto(self.url, timeout=playwright_timeout, wait_until="domcontentloaded")
+            
+            # Wait for the content to load
+            self.page.wait_for_timeout(5000)  # Wait 5 seconds for JS to render
             
             # Try multiple selectors for cricket content
             for selector in [".dashboard-champ-content", ".c-events__item_head", ".c-events__team"]:
                 try:
-                    self.page.wait_for_selector(selector, timeout=20000)
-                    logger.info(f"Found element with selector: {selector}")
-                    logger.info("Successfully navigated to the website with Playwright")
-                    return True
+                    element = self.page.wait_for_selector(selector, timeout=10000)
+                    if element:
+                        logger.info(f"Found element with selector: {selector}")
+                        return True
                 except Exception as wait_error:
                     logger.warning(f"Could not find {selector}: {wait_error}")
             
             # Check if page was loaded at all
-            title = self.page.title()
-            if "1xbet" in title.lower():
-                logger.info(f"Page loaded with title: {title}")
-                return True
-            else:
-                # Possible blocking, capture screenshot
+            page_text = self.page.content().lower()
+            if "1xbet" in page_text:
+                logger.info("Page loaded with 1xbet content, but selectors not found")
+                
+                # Save for debugging
                 try:
-                    self.page.screenshot(path="debug_html/blocked_screenshot.png")
-                    logger.info("Saved screenshot for debugging")
+                    os.makedirs("debug_html", exist_ok=True)
+                    self.page.screenshot(path="debug_html/playwright_screenshot.png")
+                    logger.info("Saved Playwright screenshot for debugging")
                     
                     with open("debug_html/playwright_content.html", "w", encoding="utf-8") as f:
                         f.write(self.page.content())
-                    logger.info("Saved page content for debugging")
+                    logger.info("Saved Playwright page content for debugging")
+                except Exception as e:
+                    logger.error(f"Failed to save debug information: {e}")
+                
+                # Try direct extraction even if selectors weren't found
+                return True
+            else:
+                logger.error("Page doesn't contain 1xbet content with Playwright")
+                
+                # Possible blocking, capture screenshot
+                try:
+                    os.makedirs("debug_html", exist_ok=True)
+                    self.page.screenshot(path="debug_html/playwright_blocked.png")
+                    logger.info("Saved blocked screenshot for debugging")
+                    
+                    with open("debug_html/playwright_blocked.html", "w", encoding="utf-8") as f:
+                        f.write(self.page.content())
+                    logger.info("Saved blocked page content for debugging")
                 except Exception as e:
                     logger.error(f"Failed to save debug information: {e}")
                     
@@ -461,24 +699,56 @@ class CricketOddsScraper:
         matches = []
         
         try:
-            # Find all cricket sections
+            # First try to find any content at all to help debug
+            page_source = self.driver.page_source
+            if "dashboard-champ-content" not in page_source:
+                logger.warning("No dashboard-champ-content found in page source")
+                if "c-events__item" not in page_source:
+                    logger.warning("No c-events__item found in page source")
+                    if "c-events__team" not in page_source:
+                        logger.error("No cricket content identifiers found in page")
+                        
+                        # Save debug info
+                        try:
+                            os.makedirs("debug_html", exist_ok=True)
+                            with open("debug_html/page_source.html", "w", encoding="utf-8") as f:
+                                f.write(page_source)
+                            self.driver.save_screenshot("debug_html/page_screenshot.png")
+                        except Exception as e:
+                            logger.error(f"Failed to save debug info: {e}")
+                        
+                        # Try to get from raw HTML if selectors aren't found
+                        return self._extract_from_raw_html(page_source)
+            
+            # Try to find all cricket sections
             cricket_sections = self.driver.find_elements(By.CSS_SELECTOR, 'div.dashboard-champ-content')
             
             if not cricket_sections:
-                logger.warning("No cricket sections found with Selenium")
+                logger.warning("No cricket sections found with dashboard-champ-content selector")
+                
+                # Try an alternative approach - look directly for match rows
+                match_rows = self.driver.find_elements(By.CSS_SELECTOR, '.c-events__item_col')
+                if match_rows:
+                    logger.info(f"Found {len(match_rows)} match rows directly")
+                    matches = self._process_match_rows(match_rows)
+                    if matches:
+                        return matches
+                
                 # Try to find any content to see if the page loaded at all
-                all_content = self.driver.find_elements(By.CSS_SELECTOR, '*')
-                logger.info(f"Total elements found on page: {len(all_content)}")
+                any_content = self.driver.find_elements(By.CSS_SELECTOR, '*')
+                logger.info(f"Total elements found on page: {len(any_content)}")
                 
                 # Save current page HTML for debugging
                 try:
+                    os.makedirs("debug_html", exist_ok=True)
                     with open("debug_html/no_cricket_sections.html", "w", encoding="utf-8") as f:
                         f.write(self.driver.page_source)
                     logger.info("Saved page HTML for debugging")
                 except Exception as e:
                     logger.error(f"Failed to save debug HTML: {e}")
-                    
-                return []
+                
+                # Try to extract from raw HTML
+                return self._extract_from_raw_html(self.driver.page_source)
             
             logger.info(f"Found {len(cricket_sections)} potential cricket sections")
             
@@ -511,107 +781,9 @@ class CricketOddsScraper:
                     # Get all match items in this section
                     match_items = section.find_elements(By.CSS_SELECTOR, '.c-events__item_col')
                     
-                    for item in match_items:
-                        try:
-                            # Extract team names
-                            team1 = ""
-                            team2 = ""
-                            try:
-                                team_elems = item.find_elements(By.CSS_SELECTOR, '.c-events__team')
-                                if len(team_elems) >= 1:
-                                    team1 = team_elems[0].text.strip()
-                                    if len(team_elems) > 1:
-                                        team2 = team_elems[1].text.strip()
-                            except (StaleElementReferenceException, NoSuchElementException) as e:
-                                logger.warning(f"Error extracting team names: {e}")
-
-                            # Create a stable ID based on team names
-                            stable_id = self._create_stable_id(team1, team2)
-                            
-                            # Initialize match data with stable ID
-                            match_data = {
-                                'id': f"match_{stable_id}",
-                                'timestamp': datetime.now().isoformat(),
-                                'team1': team1,
-                                'team2': team2,
-                                'league': league_name  # Add league name for reference
-                            }
-                            
-                            # Extract additional match info
-                            try:
-                                additional_info = item.find_elements(By.CSS_SELECTOR, '.c-events-scoreboard__additional-info')
-                                if additional_info:
-                                    match_data['info'] = additional_info[0].text.strip()
-                            except (StaleElementReferenceException, NoSuchElementException):
-                                pass
-                            
-                            # Extract current scores
-                            try:
-                                score_cells = item.find_elements(By.CSS_SELECTOR, '.c-events-scoreboard__cell--all')
-                                if score_cells and len(score_cells) > 0:
-                                    scores = [cell.text.strip() for cell in score_cells if cell.text.strip()]
-                                    if scores:
-                                        match_data['score'] = scores
-                                        match_data['in_play'] = True
-                            except (StaleElementReferenceException, NoSuchElementException) as e:
-                                logger.warning(f"Error extracting score: {e}")
-                                match_data['in_play'] = False
-                            
-                            # Extract odds
-                            odds = {'back': [], 'lay': []}
-                            
-                            try:
-                                # Get all bet cells
-                                bet_cells = item.find_elements(By.CSS_SELECTOR, '.c-bets__bet')
-                                
-                                # Process team 1 (back) odds - typically position 0 or 3
-                                team1_odds_positions = [0, 3]  # Common positions for team1 odds
-                                for pos in team1_odds_positions:
-                                    if pos < len(bet_cells):
-                                        cell = bet_cells[pos]
-                                        if "non" not in cell.get_attribute("class"):
-                                            price_elem = cell.find_element(By.CSS_SELECTOR, '.c-bets__inner')
-                                            price = price_elem.text.strip()
-                                            if price and price != '-':
-                                                odds['back'].append({
-                                                    'position': 0,
-                                                    'price': price,
-                                                    'volume': None
-                                                })
-                                
-                                # Process team 2 (lay) odds - typically position 2 or 5
-                                team2_odds_positions = [2, 5]  # Common positions for team2 odds
-                                for pos in team2_odds_positions:
-                                    if pos < len(bet_cells):
-                                        cell = bet_cells[pos]
-                                        if "non" not in cell.get_attribute("class"):
-                                            price_elem = cell.find_element(By.CSS_SELECTOR, '.c-bets__inner')
-                                            price = price_elem.text.strip()
-                                            if price and price != '-':
-                                                odds['lay'].append({
-                                                    'position': 0,
-                                                    'price': price,
-                                                    'volume': None
-                                                })
-                                
-                                # Process draw odds if available - typically position 1 or 4
-                                draw_odds_positions = [1, 4]  # Common positions for draw odds
-                                for pos in draw_odds_positions:
-                                    if pos < len(bet_cells):
-                                        cell = bet_cells[pos]
-                                        if "non" not in cell.get_attribute("class"):
-                                            price_elem = cell.find_element(By.CSS_SELECTOR, '.c-bets__inner')
-                                            price = price_elem.text.strip()
-                                            if price and price != '-':
-                                                # Add draw odds to a separate key
-                                                match_data['draw_odds'] = price
-                            except (StaleElementReferenceException, NoSuchElementException) as e:
-                                logger.warning(f"Error extracting odds: {e}")
-                            
-                            match_data['odds'] = odds
-                            matches.append(match_data)
-                        except (StaleElementReferenceException, NoSuchElementException) as e:
-                            logger.warning(f"Error processing match item: {e}")
+                    section_matches = self._process_match_rows(match_items, league_name)
+                    matches.extend(section_matches)
+                        
                 except (StaleElementReferenceException, NoSuchElementException) as e:
                     logger.warning(f"Error processing cricket section: {e}")
             
@@ -629,6 +801,190 @@ class CricketOddsScraper:
             logger.error(f"Error extracting cricket odds with Selenium: {e}")
             self.error_count += 1
             return []
+            
+    def _process_match_rows(self, match_items, league_name=""):
+        """Process match rows to extract data"""
+        matches = []
+        
+        for item in match_items:
+            try:
+                # Extract team names
+                team1 = ""
+                team2 = ""
+                try:
+                    team_elems = item.find_elements(By.CSS_SELECTOR, '.c-events__team')
+                    if len(team_elems) >= 1:
+                        team1 = team_elems[0].text.strip()
+                        if len(team_elems) > 1:
+                            team2 = team_elems[1].text.strip()
+                except (StaleElementReferenceException, NoSuchElementException) as e:
+                    logger.warning(f"Error extracting team names: {e}")
+
+                # Skip if no team names found
+                if not team1 and not team2:
+                    continue
+
+                # Create a stable ID based on team names
+                stable_id = self._create_stable_id(team1, team2)
+                
+                # Initialize match data with stable ID
+                match_data = {
+                    'id': f"match_{stable_id}",
+                    'timestamp': datetime.now().isoformat(),
+                    'team1': team1,
+                    'team2': team2,
+                    'league': league_name  # Add league name for reference
+                }
+                
+                # Extract additional match info
+                try:
+                    additional_info = item.find_elements(By.CSS_SELECTOR, '.c-events-scoreboard__additional-info')
+                    if additional_info:
+                        match_data['info'] = additional_info[0].text.strip()
+                except (StaleElementReferenceException, NoSuchElementException):
+                    pass
+                
+                # Extract current scores
+                try:
+                    score_cells = item.find_elements(By.CSS_SELECTOR, '.c-events-scoreboard__cell--all')
+                    if score_cells and len(score_cells) > 0:
+                        scores = [cell.text.strip() for cell in score_cells if cell.text.strip()]
+                        if scores:
+                            match_data['score'] = scores
+                            match_data['in_play'] = True
+                except (StaleElementReferenceException, NoSuchElementException) as e:
+                    logger.warning(f"Error extracting score: {e}")
+                    match_data['in_play'] = False
+                
+                # Extract odds
+                odds = {'back': [], 'lay': []}
+                
+                try:
+                    # Get all bet cells
+                    bet_cells = item.find_elements(By.CSS_SELECTOR, '.c-bets__bet')
+                    
+                    # Process team 1 (back) odds - typically position 0 or 3
+                    team1_odds_positions = [0, 3]  # Common positions for team1 odds
+                    for pos in team1_odds_positions:
+                        if pos < len(bet_cells):
+                            cell = bet_cells[pos]
+                            if "non" not in cell.get_attribute("class") and "c-bets__bet_coef" in cell.get_attribute("class"):
+                                price_elem = cell.find_element(By.CSS_SELECTOR, '.c-bets__inner')
+                                price = price_elem.text.strip()
+                                if price and price != '-':
+                                    odds['back'].append({
+                                        'position': 0,
+                                        'price': price,
+                                        'volume': None
+                                    })
+                    
+                    # Process team 2 (lay) odds - typically position 2 or 5
+                    team2_odds_positions = [2, 5]  # Common positions for team2 odds
+                    for pos in team2_odds_positions:
+                        if pos < len(bet_cells):
+                            cell = bet_cells[pos]
+                            if "non" not in cell.get_attribute("class") and "c-bets__bet_coef" in cell.get_attribute("class"):
+                                price_elem = cell.find_element(By.CSS_SELECTOR, '.c-bets__inner')
+                                price = price_elem.text.strip()
+                                if price and price != '-':
+                                    odds['lay'].append({
+                                        'position': 0,
+                                        'price': price,
+                                        'volume': None
+                                    })
+                    
+                    # Process draw odds if available - typically position 1 or 4
+                    draw_odds_positions = [1, 4]  # Common positions for draw odds
+                    for pos in draw_odds_positions:
+                        if pos < len(bet_cells):
+                            cell = bet_cells[pos]
+                            if "non" not in cell.get_attribute("class") and "c-bets__bet_coef" in cell.get_attribute("class"):
+                                price_elem = cell.find_element(By.CSS_SELECTOR, '.c-bets__inner')
+                                price = price_elem.text.strip()
+                                if price and price != '-':
+                                    # Add draw odds to a separate key
+                                    match_data['draw_odds'] = price
+                except (StaleElementReferenceException, NoSuchElementException) as e:
+                    logger.warning(f"Error extracting odds: {e}")
+                
+                match_data['odds'] = odds
+                matches.append(match_data)
+            except (StaleElementReferenceException, NoSuchElementException) as e:
+                logger.warning(f"Error processing match item: {e}")
+                
+        return matches
+        
+    def _extract_from_raw_html(self, html_content):
+        """Extract match data from raw HTML when selectors fail"""
+        import re
+        matches = []
+        
+        # Extract teams using regex pattern
+        team_pattern = r'<div class="c-events__team">\s*([^<]+?)\s*</div>'
+        teams = re.findall(team_pattern, html_content)
+        
+        # Extract scores
+        score_pattern = r'<span class="c-events-scoreboard__cell c-events-scoreboard__cell--all">([^<]+?)</span>'
+        scores = re.findall(score_pattern, html_content)
+        
+        # Extract odds
+        odds_pattern = r'<span class="c-bets__bet c-bets__bet_coef[^"]*"><span class="c-bets__inner">([^<]+?)</span></span>'
+        odds_values = re.findall(odds_pattern, html_content)
+        
+        # Extract leagues
+        league_pattern = r'class="c-events__liga"[^>]*>\s*([^<]+?)\s*</a>'
+        leagues = re.findall(league_pattern, html_content)
+        
+        # If we found teams, create matches
+        if teams and len(teams) >= 2:
+            logger.info(f"Extracted {len(teams)} teams using regex")
+            
+            # Process in pairs for team1 and team2
+            for i in range(0, len(teams), 2):
+                if i + 1 < len(teams):
+                    team1 = teams[i].strip()
+                    team2 = teams[i+1].strip()
+                    
+                    # Create a stable ID
+                    stable_id = self._create_stable_id(team1, team2)
+                    
+                    # Initialize match data
+                    match_data = {
+                        'id': f"match_{stable_id}",
+                        'timestamp': datetime.now().isoformat(),
+                        'team1': team1,
+                        'team2': team2,
+                        'league': leagues[i//2] if i//2 < len(leagues) else ""
+                    }
+                    
+                    # Add scores if available
+                    score_idx = i // 2 * 2
+                    if score_idx + 1 < len(scores):
+                        match_data['score'] = [scores[score_idx], scores[score_idx+1]]
+                        match_data['in_play'] = True
+                    
+                    # Add odds if available
+                    odds_idx = i // 2 * 2
+                    odds = {'back': [], 'lay': []}
+                    if odds_idx < len(odds_values):
+                        odds['back'].append({
+                            'position': 0,
+                            'price': odds_values[odds_idx],
+                            'volume': None
+                        })
+                    
+                    if odds_idx + 1 < len(odds_values):
+                        odds['lay'].append({
+                            'position': 0,
+                            'price': odds_values[odds_idx+1],
+                            'volume': None
+                        })
+                    
+                    match_data['odds'] = odds
+                    matches.append(match_data)
+        
+        logger.info(f"Extracted {len(matches)} matches from raw HTML")
+        return matches
     
     def _extract_with_playwright(self):
         """Extract cricket odds data using Playwright"""
