@@ -13,24 +13,15 @@ import json
 import logging
 import threading
 import uvicorn
+import asyncio
+import sys
+import subprocess
 from typing import List, Dict, Any, Optional, Union
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, status, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import (
-    WebDriverException, 
-    TimeoutException, 
-    NoSuchElementException, 
-    StaleElementReferenceException
-)
 
 # Configure logging
 logging.basicConfig(
@@ -119,6 +110,56 @@ scraper_state = {
     "lock": threading.Lock()
 }
 
+# Try to install and import relevant packages first
+try:
+    # Check if we need to install dependencies
+    if IS_PRODUCTION:
+        logger.info("Installing required packages in production environment")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "webdriver-manager", "selenium", "playwright"])
+        # Try to install playwright browsers
+        try:
+            subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+            logger.info("Playwright browsers installed successfully")
+        except Exception as e:
+            logger.warning(f"Failed to install Playwright browsers: {e}")
+    
+    # Import the required packages
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.common.exceptions import (
+        WebDriverException, 
+        TimeoutException, 
+        NoSuchElementException, 
+        StaleElementReferenceException
+    )
+    
+    # Try to import webdriver_manager
+    try:
+        from webdriver_manager.chrome import ChromeDriverManager
+        from webdriver_manager.core.utils import ChromeType
+        WEBDRIVER_MANAGER_AVAILABLE = True
+        logger.info("WebDriver Manager is available")
+    except ImportError:
+        WEBDRIVER_MANAGER_AVAILABLE = False
+        logger.warning("WebDriver Manager not available, will use system ChromeDriver")
+    
+    # Try to import playwright
+    try:
+        from playwright.sync_api import sync_playwright
+        PLAYWRIGHT_AVAILABLE = True
+        logger.info("Playwright is available")
+    except ImportError:
+        PLAYWRIGHT_AVAILABLE = False
+        logger.warning("Playwright not available, will use Selenium only")
+    
+except Exception as e:
+    logger.error(f"Error importing browser automation libraries: {e}")
+    # We'll need to handle this gracefully in the application
+
 class CricketOddsScraper:
     """Scraper for extracting cricket odds from 1xbet"""
     
@@ -130,9 +171,19 @@ class CricketOddsScraper:
         self.error_count = 0
         self.max_continuous_errors = 10
         self.force_refresh = False
+        self.use_playwright = False
+        self.playwright = None
+        self.browser = None
+        self.page = None
+        self.navigation_timeout = int(os.environ.get('SELENIUM_TIMEOUT', 30))
     
     def setup_driver(self):
-        """Set up the Selenium WebDriver with fallback options"""
+        """Set up the browser driver with fallback options"""
+        # Check if we should use Playwright
+        if self.use_playwright and PLAYWRIGHT_AVAILABLE:
+            return self._setup_playwright()
+        
+        # Use Selenium as the default option
         try:
             # Close existing driver if any
             if self.driver:
@@ -143,35 +194,46 @@ class CricketOddsScraper:
             
             # Configure Chrome options
             chrome_options = Options()
-            chrome_options.add_argument("--headless")
+            chrome_options.add_argument("--headless=new")  # Use new headless mode
             chrome_options.add_argument("--no-sandbox")
             chrome_options.add_argument("--disable-dev-shm-usage")
             chrome_options.add_argument("--disable-gpu")
             chrome_options.add_argument("--window-size=1920,1080")
             
+            # Add options to bypass detection
+            chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            chrome_options.add_experimental_option("useAutomationExtension", False)
+            
             # Add user agent to avoid detection
-            chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+            chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
             
-            # Try to create WebDriver with direct ChromeDriver path
-            try:
-                logger.info("Trying with direct ChromeDriver path")
-                service = Service(executable_path="/usr/local/bin/chromedriver")
-                self.driver = webdriver.Chrome(service=service, options=chrome_options)
-                logger.info("Successfully created WebDriver with direct path")
-                self.retry_count = 0
-                return True
-            except Exception as e:
-                logger.error(f"Direct path attempt failed: {e}")
+            # Try with WebDriver Manager if available
+            if WEBDRIVER_MANAGER_AVAILABLE:
+                try:
+                    logger.info("Setting up Chrome with webdriver-manager")
+                    self.driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+                    logger.info("Successfully created WebDriver with webdriver-manager")
+                    self.retry_count = 0
+                    return True
+                except Exception as e:
+                    logger.error(f"Webdriver-manager setup failed: {e}")
             
-            # Try with default system-wide ChromeDriver
+            # Try with system Chrome
             try:
-                logger.info("Trying with system-wide ChromeDriver")
+                logger.info("Trying with system Chrome")
                 self.driver = webdriver.Chrome(options=chrome_options)
-                logger.info("Successfully created WebDriver with system-wide ChromeDriver")
+                logger.info("Successfully created WebDriver with system Chrome")
                 self.retry_count = 0
                 return True
             except Exception as e:
-                logger.error(f"System-wide ChromeDriver attempt failed: {e}")
+                logger.error(f"System Chrome attempt failed: {e}")
+            
+            # Fall back to Playwright if all Selenium attempts failed
+            if PLAYWRIGHT_AVAILABLE:
+                logger.info("Falling back to Playwright")
+                self.use_playwright = True
+                return self._setup_playwright()
             
             # All attempts failed
             self.retry_count += 1
@@ -180,37 +242,188 @@ class CricketOddsScraper:
                 logger.info(f"Retrying driver setup (attempt {self.retry_count}/{self.max_retries})...")
                 time.sleep(5)
                 return self.setup_driver()
+            
             return False
         except Exception as e:
             logger.error(f"Error initializing WebDriver: {e}")
             self.retry_count += 1
             self.error_count += 1
+            
+            # Try Playwright as fallback
+            if PLAYWRIGHT_AVAILABLE and not self.use_playwright:
+                logger.info("Trying Playwright after Selenium error")
+                self.use_playwright = True
+                return self._setup_playwright()
+            
             if self.retry_count < self.max_retries:
                 logger.info(f"Retrying driver setup (attempt {self.retry_count}/{self.max_retries})...")
                 time.sleep(5)
                 return self.setup_driver()
+            
+            return False
+    
+    def _setup_playwright(self):
+        """Set up Playwright as an alternative to Selenium"""
+        if not PLAYWRIGHT_AVAILABLE:
+            logger.error("Playwright not available")
+            return False
+        
+        logger.info("Setting up Playwright")
+        try:
+            # Clean up existing browser if any
+            if self.browser:
+                try:
+                    self.browser.close()
+                except:
+                    pass
+                
+            if self.playwright:
+                try:
+                    self.playwright.stop()
+                except:
+                    pass
+            
+            # Start new playwright instance
+            self.playwright = sync_playwright().start()
+            self.browser = self.playwright.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                ]
+            )
+            self.page = self.browser.new_page(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                viewport={"width": 1920, "height": 1080}
+            )
+            
+            # Set flag to use Playwright for all subsequent operations
+            self.use_playwright = True
+            logger.info("Successfully set up Playwright")
+            self.retry_count = 0
+            return True
+        except Exception as e:
+            logger.error(f"Failed to set up Playwright: {e}")
+            self.use_playwright = False
+            self.retry_count += 1
+            self.error_count += 1
+            
+            if self.retry_count < self.max_retries:
+                logger.info(f"Retrying Playwright setup (attempt {self.retry_count}/{self.max_retries})...")
+                time.sleep(5)
+                return self._setup_playwright()
+            
             return False
     
     def navigate_to_site(self):
         """Navigate to the website and wait for it to load"""
+        if self.use_playwright:
+            return self._navigate_with_playwright()
+        else:
+            return self._navigate_with_selenium()
+    
+    def _navigate_with_selenium(self):
+        """Navigate using Selenium WebDriver"""
         try:
+            # Add stealth mode behaviors
+            self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                'source': '''
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                })
+                '''
+            })
+            
+            # Navigate to site with extended timeout
+            self.driver.set_page_load_timeout(self.navigation_timeout)
             self.driver.get(self.url)
+            
             # Wait for the cricket section to load
-            WebDriverWait(self.driver, 20).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, ".dashboard-champ-content"))
-            )
-            logger.info("Successfully navigated to the website")
-            return True
-        except TimeoutException:
-            logger.error("Timeout while loading the website")
-            self.error_count += 1
-            return False
+            try:
+                WebDriverWait(self.driver, self.navigation_timeout).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, ".dashboard-champ-content"))
+                )
+                logger.info("Successfully navigated to the website with Selenium")
+                return True
+            except TimeoutException:
+                # Try checking if we're being blocked (might redirect to captcha)
+                if "captcha" in self.driver.page_source.lower() or "1xbet" not in self.driver.page_source.lower():
+                    logger.error("Possible bot detection or blocking. Page doesn't contain expected content.")
+                    
+                    # Debug: Save HTML
+                    try:
+                        with open("debug_html/blocked_page.html", "w", encoding="utf-8") as f:
+                            f.write(self.driver.page_source)
+                        logger.info("Saved blocked page HTML for debugging")
+                    except Exception as e:
+                        logger.error(f"Failed to save debug HTML: {e}")
+                    
+                    # Fall back to Playwright if available
+                    if PLAYWRIGHT_AVAILABLE and not self.use_playwright:
+                        logger.info("Trying Playwright after possible blocking")
+                        self.use_playwright = True
+                        if self._setup_playwright():
+                            return self._navigate_with_playwright()
+                    
+                    return False
+                
+                logger.error("Timeout while loading the website with Selenium")
+                self.error_count += 1
+                return False
         except WebDriverException as e:
             logger.error(f"WebDriver error while navigating: {e}")
             self.error_count += 1
             return False
         except Exception as e:
-            logger.error(f"Unexpected error while navigating: {e}")
+            logger.error(f"Unexpected error while navigating with Selenium: {e}")
+            self.error_count += 1
+            return False
+    
+    def _navigate_with_playwright(self):
+        """Navigate using Playwright"""
+        try:
+            # Navigate with Playwright
+            logger.info(f"Navigating to {self.url} with Playwright")
+            
+            # Set longer timeout for navigation
+            playwright_timeout = int(os.environ.get('PLAYWRIGHT_TIMEOUT', 60)) * 1000  # Convert to ms
+            
+            # Go to the URL with extended timeout
+            self.page.goto(self.url, timeout=playwright_timeout)
+            
+            # Try multiple selectors for cricket content
+            for selector in [".dashboard-champ-content", ".c-events__item_head", ".c-events__team"]:
+                try:
+                    self.page.wait_for_selector(selector, timeout=20000)
+                    logger.info(f"Found element with selector: {selector}")
+                    logger.info("Successfully navigated to the website with Playwright")
+                    return True
+                except Exception as wait_error:
+                    logger.warning(f"Could not find {selector}: {wait_error}")
+            
+            # Check if page was loaded at all
+            title = self.page.title()
+            if "1xbet" in title.lower():
+                logger.info(f"Page loaded with title: {title}")
+                return True
+            else:
+                # Possible blocking, capture screenshot
+                try:
+                    self.page.screenshot(path="debug_html/blocked_screenshot.png")
+                    logger.info("Saved screenshot for debugging")
+                    
+                    with open("debug_html/playwright_content.html", "w", encoding="utf-8") as f:
+                        f.write(self.page.content())
+                    logger.info("Saved page content for debugging")
+                except Exception as e:
+                    logger.error(f"Failed to save debug information: {e}")
+                    
+                logger.error("Navigation failed, possibly blocked")
+                self.error_count += 1
+                return False
+        except Exception as e:
+            logger.error(f"Error navigating with Playwright: {e}")
             self.error_count += 1
             return False
     
@@ -238,11 +451,36 @@ class CricketOddsScraper:
     
     def extract_cricket_odds(self):
         """Extract cricket odds data from the loaded page"""
+        if self.use_playwright:
+            return self._extract_with_playwright()
+        else:
+            return self._extract_with_selenium()
+    
+    def _extract_with_selenium(self):
+        """Extract cricket odds data using Selenium"""
         matches = []
         
         try:
             # Find all cricket sections
             cricket_sections = self.driver.find_elements(By.CSS_SELECTOR, 'div.dashboard-champ-content')
+            
+            if not cricket_sections:
+                logger.warning("No cricket sections found with Selenium")
+                # Try to find any content to see if the page loaded at all
+                all_content = self.driver.find_elements(By.CSS_SELECTOR, '*')
+                logger.info(f"Total elements found on page: {len(all_content)}")
+                
+                # Save current page HTML for debugging
+                try:
+                    with open("debug_html/no_cricket_sections.html", "w", encoding="utf-8") as f:
+                        f.write(self.driver.page_source)
+                    logger.info("Saved page HTML for debugging")
+                except Exception as e:
+                    logger.error(f"Failed to save debug HTML: {e}")
+                    
+                return []
+            
+            logger.info(f"Found {len(cricket_sections)} potential cricket sections")
             
             for section in cricket_sections:
                 try:
@@ -378,17 +616,174 @@ class CricketOddsScraper:
                     logger.warning(f"Error processing cricket section: {e}")
             
             if matches:
-                logger.info(f"Extracted {len(matches)} cricket matches")
+                logger.info(f"Extracted {len(matches)} cricket matches with Selenium")
                 # Reset error count on successful extraction
                 self.error_count = 0
             else:
-                logger.warning("No cricket matches found")
+                logger.warning("No cricket matches found with Selenium")
                 self.error_count += 1
             
             return matches
             
         except Exception as e:
-            logger.error(f"Error extracting cricket odds: {e}")
+            logger.error(f"Error extracting cricket odds with Selenium: {e}")
+            self.error_count += 1
+            return []
+    
+    def _extract_with_playwright(self):
+        """Extract cricket odds data using Playwright"""
+        matches = []
+        
+        try:
+            # Find all cricket sections
+            cricket_sections = self.page.query_selector_all('div.dashboard-champ-content')
+            
+            if not cricket_sections:
+                logger.warning("No cricket sections found with Playwright")
+                # Save screenshot and page content for debugging
+                try:
+                    self.page.screenshot(path="debug_html/no_cricket_sections_pw.png")
+                    with open("debug_html/no_cricket_sections_pw.html", "w", encoding="utf-8") as f:
+                        f.write(self.page.content())
+                    logger.info("Saved debug information for Playwright")
+                except Exception as e:
+                    logger.error(f"Failed to save debug information: {e}")
+                return []
+            
+            logger.info(f"Found {len(cricket_sections)} potential cricket sections with Playwright")
+            
+            for section in cricket_sections:
+                try:
+                    # Check league headers to find cricket leagues
+                    header_elements = section.query_selector_all('.c-events__item_head')
+                    
+                    is_cricket_section = False
+                    for elem in header_elements:
+                        # Look for the cricket icon in the header
+                        cricket_icon = elem.query_selector('svg.icon use[xlink:href*="sports_66"]')
+                        if cricket_icon:
+                            is_cricket_section = True
+                            break
+                    
+                    if not is_cricket_section:
+                        continue
+                    
+                    # Get league name for reference
+                    league_name = ""
+                    league_elem = section.query_selector('.c-events__liga')
+                    if league_elem:
+                        league_name = league_elem.inner_text().strip()
+                        
+                    # Get all match items in this section
+                    match_items = section.query_selector_all('.c-events__item_col')
+                    
+                    for item in match_items:
+                        # Extract team names
+                        team1 = ""
+                        team2 = ""
+                        team_elems = item.query_selector_all('.c-events__team')
+                        if len(team_elems) >= 1:
+                            team1 = team_elems[0].inner_text().strip()
+                            if len(team_elems) > 1:
+                                team2 = team_elems[1].inner_text().strip()
+
+                        # Create a stable ID based on team names
+                        stable_id = self._create_stable_id(team1, team2)
+                        
+                        # Initialize match data with stable ID
+                        match_data = {
+                            'id': f"match_{stable_id}",
+                            'timestamp': datetime.now().isoformat(),
+                            'team1': team1,
+                            'team2': team2,
+                            'league': league_name  # Add league name for reference
+                        }
+                        
+                        # Extract additional match info
+                        additional_info = item.query_selector('.c-events-scoreboard__additional-info')
+                        if additional_info:
+                            match_data['info'] = additional_info.inner_text().strip()
+                        
+                        # Extract current scores
+                        score_cells = item.query_selector_all('.c-events-scoreboard__cell--all')
+                        if score_cells and len(score_cells) > 0:
+                            scores = [cell.inner_text().strip() for cell in score_cells if cell.inner_text().strip()]
+                            if scores:
+                                match_data['score'] = scores
+                                match_data['in_play'] = True
+                        else:
+                            match_data['in_play'] = False
+                        
+                        # Extract odds
+                        odds = {'back': [], 'lay': []}
+                        
+                        # Get all bet cells
+                        bet_cells = item.query_selector_all('.c-bets__bet')
+                        
+                        # Process team 1 (back) odds - typically position 0 or 3
+                        team1_odds_positions = [0, 3]  # Common positions for team1 odds
+                        for pos in team1_odds_positions:
+                            if pos < len(bet_cells):
+                                cell = bet_cells[pos]
+                                class_attr = cell.get_attribute('class') or ""
+                                if "non" not in class_attr:
+                                    price_elem = cell.query_selector('.c-bets__inner')
+                                    if price_elem:
+                                        price = price_elem.inner_text().strip()
+                                        if price and price != '-':
+                                            odds['back'].append({
+                                                'position': 0,
+                                                'price': price,
+                                                'volume': None
+                                            })
+                        
+                        # Process team 2 (lay) odds - typically position 2 or 5
+                        team2_odds_positions = [2, 5]  # Common positions for team2 odds
+                        for pos in team2_odds_positions:
+                            if pos < len(bet_cells):
+                                cell = bet_cells[pos]
+                                class_attr = cell.get_attribute('class') or ""
+                                if "non" not in class_attr:
+                                    price_elem = cell.query_selector('.c-bets__inner')
+                                    if price_elem:
+                                        price = price_elem.inner_text().strip()
+                                        if price and price != '-':
+                                            odds['lay'].append({
+                                                'position': 0,
+                                                'price': price,
+                                                'volume': None
+                                            })
+                        
+                        # Process draw odds if available - typically position 1 or 4
+                        draw_odds_positions = [1, 4]  # Common positions for draw odds
+                        for pos in draw_odds_positions:
+                            if pos < len(bet_cells):
+                                cell = bet_cells[pos]
+                                class_attr = cell.get_attribute('class') or ""
+                                if "non" not in class_attr:
+                                    price_elem = cell.query_selector('.c-bets__inner')
+                                    if price_elem:
+                                        price = price_elem.inner_text().strip()
+                                        if price and price != '-':
+                                            # Add draw odds to a separate key
+                                            match_data['draw_odds'] = price
+                        
+                        match_data['odds'] = odds
+                        matches.append(match_data)
+                except Exception as e:
+                    logger.warning(f"Error processing cricket section with Playwright: {e}")
+            
+            if matches:
+                logger.info(f"Extracted {len(matches)} cricket matches with Playwright")
+                # Reset error count on successful extraction
+                self.error_count = 0
+            else:
+                logger.warning("No cricket matches found with Playwright")
+                self.error_count += 1
+            
+            return matches
+        except Exception as e:
+            logger.error(f"Error extracting cricket odds with Playwright: {e}")
             self.error_count += 1
             return []
     
@@ -630,12 +1025,22 @@ class CricketOddsScraper:
                         
                         logger.debug(f"New match added: {new_match['id']}")
                 
-                # Check for removed matches
-                for old_id, old_match in current_matches_by_id.items():
-                    if old_id not in processed_ids:
-                        # Match was removed
-                        changes_made += 1
-                        logger.debug(f"Match removed: {old_id}")
+                # When in recovery mode after errors, don't remove matches
+                keep_existing = self.error_count > self.max_continuous_errors / 2
+                
+                # Check for removed matches, but don't remove if we're in recovery mode
+                if not keep_existing:
+                    for old_id, old_match in current_matches_by_id.items():
+                        if old_id not in processed_ids:
+                            # Match was removed
+                            changes_made += 1
+                            logger.debug(f"Match removed: {old_id}")
+                else:
+                    # In recovery mode, keep all existing matches that weren't updated
+                    for old_id, old_match in current_matches_by_id.items():
+                        if old_id not in processed_ids:
+                            updated_matches.append(old_match)
+                            logger.debug(f"Kept existing match in recovery mode: {old_id}")
                 
                 # Create output data structure
                 output_data = {
@@ -700,7 +1105,7 @@ class CricketOddsScraper:
         logger.info(f"Starting cricket odds scraper with {interval} second intervals")
         
         if not self.setup_driver():
-            logger.error("Failed to set up WebDriver. Exiting.")
+            logger.error("Failed to set up browser driver. Exiting.")
             with scraper_state["lock"]:
                 scraper_state["is_running"] = False
                 scraper_state["status"] = "failed"
@@ -713,6 +1118,11 @@ class CricketOddsScraper:
             # Navigate to the site initially
             if not self.navigate_to_site():
                 logger.error("Failed to navigate to the website. Retrying setup...")
+                
+                # Try with longer timeout
+                self.navigation_timeout = self.navigation_timeout * 2
+                logger.info(f"Increasing timeout to {self.navigation_timeout} seconds")
+                
                 if not self.setup_driver() or not self.navigate_to_site():
                     logger.error("Still failed to navigate. Exiting.")
                     with scraper_state["lock"]:
@@ -736,10 +1146,39 @@ class CricketOddsScraper:
                 # Check if we've had too many continuous errors
                 if self.error_count >= self.max_continuous_errors:
                     logger.error(f"Reached maximum continuous errors ({self.max_continuous_errors}). Resetting driver...")
+                    
+                    # Try switching to Playwright if we're using Selenium
+                    if not self.use_playwright and PLAYWRIGHT_AVAILABLE:
+                        logger.info("Switching to Playwright after multiple Selenium errors")
+                        self.use_playwright = True
+                        if self._setup_playwright() and self.navigate_to_site():
+                            logger.info("Successfully switched to Playwright")
+                            self.error_count = 0
+                            continue
+                        else:
+                            logger.error("Failed to switch to Playwright")
+                    
+                    # Try switching back to Selenium if Playwright is failing
+                    if self.use_playwright:
+                        logger.info("Switching back to Selenium after Playwright errors")
+                        self.use_playwright = False
+                        if self.setup_driver() and self.navigate_to_site():
+                            logger.info("Successfully switched back to Selenium")
+                            self.error_count = 0
+                            continue
+                        else:
+                            logger.error("Failed to switch back to Selenium")
+                            
+                    # If still failing, wait longer before retrying
+                    logger.error("Both Selenium and Playwright failed. Waiting 60 seconds...")
+                    time.sleep(60)
+                    
+                    # Try one more reset
                     if not self.setup_driver() or not self.navigate_to_site():
-                        logger.error("Driver reset failed. Waiting before retrying...")
-                        time.sleep(30)  # Wait longer before retrying
+                        logger.error("Driver reset failed. Increasing wait time...")
+                        time.sleep(120)  # Wait even longer before next try
                         continue
+                    
                     self.error_count = 0
                 
                 # Check if we need to refresh the page
@@ -755,8 +1194,13 @@ class CricketOddsScraper:
                 
                 # Extract and update the data
                 matches = self.extract_cricket_odds()
+                
                 if matches:
                     self.update_global_state(matches)
+                    # If successful extraction after errors, log the recovery
+                    if self.error_count > 0:
+                        logger.info(f"Recovered after {self.error_count} errors")
+                        self.error_count = 0
                 
                 refresh_count += 1
                 
@@ -778,11 +1222,17 @@ class CricketOddsScraper:
         finally:
             # Clean up
             try:
-                if self.driver:
+                if not self.use_playwright and self.driver:
                     self.driver.quit()
                     logger.info("WebDriver closed")
-            except:
-                pass
+                elif self.use_playwright:
+                    if self.browser:
+                        self.browser.close()
+                    if self.playwright:
+                        self.playwright.stop()
+                    logger.info("Playwright browser closed")
+            except Exception as e:
+                logger.error(f"Error closing browser: {e}")
             
             # Update scraper state
             with scraper_state["lock"]:
@@ -792,12 +1242,39 @@ class CricketOddsScraper:
 # Create a function to start the scraper in a background thread
 def start_scraper_thread():
     if not scraper_state["is_running"]:
-        # Create and start the thread
-        scraper = CricketOddsScraper()
-        thread = threading.Thread(target=scraper.run, args=(2,), daemon=True)
-        thread.start()
-        logger.info("Scraper thread started")
-        return True
+        try:
+            # Set up debug directories
+            os.makedirs("debug_html", exist_ok=True)
+            
+            # Create and start the thread
+            scraper = CricketOddsScraper()
+            thread = threading.Thread(target=scraper.run, args=(2,), daemon=True)
+            thread.start()
+            logger.info("Scraper thread started")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to start scraper thread: {e}")
+            # Try to install additional dependencies if needed
+            try:
+                logger.info("Installing additional dependencies and trying again")
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "-U", 
+                                      "webdriver-manager", "playwright", "selenium"])
+                
+                # Try to install playwright browsers
+                try:
+                    subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
+                except Exception as e:
+                    logger.warning(f"Failed to install Playwright browsers: {e}")
+                
+                # Try again with fresh scraper
+                scraper = CricketOddsScraper()
+                thread = threading.Thread(target=scraper.run, args=(2,), daemon=True)
+                thread.start()
+                logger.info("Scraper thread started after installing dependencies")
+                return True
+            except Exception as e2:
+                logger.error(f"Failed to start scraper after installing dependencies: {e2}")
+                return False
     else:
         logger.info("Scraper is already running")
         return False
@@ -805,6 +1282,9 @@ def start_scraper_thread():
 # Load existing data if available
 def load_existing_data():
     try:
+        # Create data directory if it doesn't exist
+        os.makedirs(DATA_DIR, exist_ok=True)
+        
         # Load main data file
         if os.path.exists(DATA_FILE):
             with open(DATA_FILE, 'r', encoding='utf-8') as f:
@@ -1019,6 +1499,9 @@ async def startup_event():
     
     # Initialize scraper state
     scraper_state["start_time"] = datetime.now()
+    
+    # Create required directories
+    os.makedirs("debug_html", exist_ok=True)
     
     # Start the scraper automatically
     start_scraper_thread()
