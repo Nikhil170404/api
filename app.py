@@ -163,7 +163,7 @@ except Exception as e:
 class CricketOddsScraper:
     """Scraper for extracting cricket odds from 1xbet"""
     
-    def __init__(self, url="https://ind.1xbet.com/live/cricket"):
+    def __init__(self, url="https://ind.1xbet.com/"):
         self.url = url
         self.driver = None
         self.retry_count = 0
