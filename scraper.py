@@ -1,10 +1,12 @@
-# Updated scraper.py with direct Chrome driver initialization
+# Updated scraper.py with debugging capabilities
 import time
 import random
 import json
 import pandas as pd
 import os
 import subprocess
+import platform
+import sys
 from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -28,7 +30,10 @@ class XbetScraper:
         self.chrome_options.add_argument("--disable-extensions")
         self.chrome_options.add_argument("--disable-infobars")
         self.chrome_options.add_argument("--window-size=1366,768")
-        self.chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+        self.chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36")
+        
+        # Add anti-detection options
+        self.chrome_options.add_argument('--disable-blink-features=AutomationControlled')
         
         # Reduce memory usage
         self.chrome_options.add_argument("--js-flags=--expose-gc")
@@ -64,7 +69,7 @@ class XbetScraper:
         print("Setting up Chrome WebDriver...")
         try:
             self.driver = webdriver.Chrome(options=self.chrome_options)
-            self.wait = WebDriverWait(self.driver, 10)
+            self.wait = WebDriverWait(self.driver, 15)  # Increased timeout
             print("WebDriver initialized successfully")
         except Exception as e:
             print(f"Error initializing Chrome WebDriver: {e}")
@@ -76,7 +81,7 @@ class XbetScraper:
                 simple_options.add_argument("--no-sandbox")
                 simple_options.add_argument("--disable-dev-shm-usage")
                 self.driver = webdriver.Chrome(options=simple_options)
-                self.wait = WebDriverWait(self.driver, 10)
+                self.wait = WebDriverWait(self.driver, 15)
                 print("Alternative WebDriver initialization successful")
             except Exception as e2:
                 print(f"Alternative WebDriver initialization also failed: {e2}")
@@ -91,34 +96,108 @@ class XbetScraper:
             except:
                 print("Error closing WebDriver")
     
+    def check_page_content(self, html_content):
+        """Diagnostic function to check what's actually in the page content"""
+        print(f"Page content length: {len(html_content) if html_content else 0} characters")
+        
+        # Save the page content for debugging
+        try:
+            os.makedirs("debug", exist_ok=True)
+            with open("debug/debug_page.html", "w", encoding="utf-8") as f:
+                f.write(html_content if html_content else "No content")
+            print("Saved page content to debug/debug_page.html")
+        except Exception as e:
+            print(f"Error saving debug file: {e}")
+        
+        # Check for common indicators
+        if html_content:
+            if "1xBet" in html_content:
+                print("1xBet brand detected in page")
+            if "Please confirm you are not a robot" in html_content:
+                print("CAPTCHA detected - website thinks we're a bot")
+            if "Access denied" in html_content:
+                print("Access denied message detected")
+            if "c-events__item" in html_content:
+                print("Found event items in HTML, but couldn't select them")
+            if "greenBack" in html_content:
+                print("Found greenBack container in HTML")
+            if "blueBack" in html_content:
+                print("Found blueBack container in HTML")
+            if "line_bets_on_main" in html_content:
+                print("Found line_bets_on_main ID in HTML")
+        
+        return html_content
+    
     def get_page_content(self, url=None):
         """Fetch the page content with Selenium and wait for it to load"""
         try:
             target_url = url if url else self.base_url
             print(f"Fetching page: {target_url}")
+            
+            # Add additional options to bypass some restrictions
+            try:
+                self.driver.execute_cdp_cmd("Network.setCacheDisabled", {"cacheDisabled": True})
+                
+                # Add more realistic user behavior
+                self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                    "source": """
+                        Object.defineProperty(navigator, 'webdriver', {
+                            get: () => undefined
+                        });
+                    """
+                })
+                
+                # Try a different user agent
+                self.driver.execute_cdp_cmd("Network.setUserAgentOverride", {
+                    "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36"
+                })
+                
+                print("Applied anti-detection measures")
+            except Exception as e:
+                print(f"Error applying CDP commands: {e}")
+            
+            # Load the page
             self.driver.get(target_url)
             
             # Wait for the content to load
             try:
-                self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".c-events__item")))
-                print("Main content elements loaded")
+                self.wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+                print("Basic page structure loaded")
             except:
-                print("Warning: Timed out waiting for .c-events__item, will try to continue")
+                print("Warning: Timed out waiting for basic page structure")
+            
+            # Try different selectors that might be more reliable
+            try:
+                self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "div.c-events, div.dashboard-content, div[id='line_bets_on_main']")))
+                print("Found content containers")
+            except:
+                print("Warning: Timed out waiting for content containers")
             
             # Enhanced scrolling to ensure all content is loaded
             print("Scrolling page to load more content...")
             # First scroll to middle
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight/3);")
-            time.sleep(0.5)
+            time.sleep(1)
             # Then scroll to two-thirds
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight*2/3);")
-            time.sleep(0.5)
+            time.sleep(1)
             # Finally scroll to bottom
             self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(1)
+            time.sleep(2)
+            
+            # Take a screenshot for diagnostic purposes
+            try:
+                os.makedirs("debug", exist_ok=True)
+                self.driver.save_screenshot("debug/page_screenshot.png")
+                print("Saved screenshot to debug/page_screenshot.png")
+            except Exception as e:
+                print(f"Failed to save screenshot: {e}")
             
             print("Page loaded successfully")
-            return self.driver.page_source
+            html_content = self.driver.page_source
+            
+            # Check the content
+            return self.check_page_content(html_content)
         except Exception as e:
             print(f"Error fetching page: {e}")
             return None
@@ -128,15 +207,33 @@ class XbetScraper:
         soup = BeautifulSoup(html_content, 'html.parser')
         live_events = []
         
-        # Find the container for live events - looking for the LIVE Bets section
-        live_container = soup.select_one('div[id="line_bets_on_main"].c-events.greenBack')
+        # Try different selectors for the live events container
+        live_container = None
+        selectors = [
+            'div[id="line_bets_on_main"].c-events.greenBack',
+            'div.c-events.greenBack',
+            'div.greenBack',
+            'div[id="line_bets_on_main"]'
+        ]
+        
+        for selector in selectors:
+            live_container = soup.select_one(selector)
+            if live_container:
+                print(f"Found live container using selector: {selector}")
+                break
+        
         if not live_container:
-            print("Live events container not found")
+            print("Live events container not found after trying multiple selectors")
             return live_events
             
         # Find all live events containers - these are the league sections
         live_sections = live_container.select('.dashboard-champ-content')
         print(f"Found {len(live_sections)} live sections")
+        
+        if not live_sections:
+            print("Trying alternative selectors for live sections")
+            live_sections = live_container.select('div[data-name="dashboard-champ-content"]')
+            print(f"Found {len(live_sections)} live sections with alternative selector")
         
         for section_index, section in enumerate(live_sections):
             # Get league info from the header
@@ -169,9 +266,23 @@ class XbetScraper:
             
             print(f"Available bet types: {bet_types}")
             
-            # Get all matches in this league
-            matches = section.select('.c-events__item_col .c-events__item_game')
-            print(f"Found {len(matches)} matches in {league_name}")
+            # Get all matches in this league - try multiple selectors
+            matches = []
+            selectors = [
+                '.c-events__item_col .c-events__item_game',
+                '.c-events__item_game',
+                '.c-events-item'
+            ]
+            
+            for selector in selectors:
+                matches = section.select(selector)
+                if matches:
+                    print(f"Found {len(matches)} matches in {league_name} using selector: {selector}")
+                    break
+            
+            if not matches:
+                print(f"No matches found in {league_name} after trying multiple selectors")
+                continue
             
             for match_index, match in enumerate(matches):
                 match_data = {
@@ -247,15 +358,33 @@ class XbetScraper:
         soup = BeautifulSoup(html_content, 'html.parser')
         upcoming_events = []
         
-        # Find the Sportsbook section (blueBack container)
-        upcoming_container = soup.select_one('div[id="line_bets_on_main"].c-events.blueBack')
+        # Try different selectors for the upcoming events container
+        upcoming_container = None
+        selectors = [
+            'div[id="line_bets_on_main"].c-events.blueBack',
+            'div.c-events.blueBack',
+            'div.blueBack',
+            'div[id="line_bets_on_main"]'
+        ]
+        
+        for selector in selectors:
+            upcoming_container = soup.select_one(selector)
+            if upcoming_container:
+                print(f"Found upcoming container using selector: {selector}")
+                break
+        
         if not upcoming_container:
-            print("Upcoming events container not found")
+            print("Upcoming events container not found after trying multiple selectors")
             return upcoming_events
             
         # Find all upcoming events containers
         upcoming_sections = upcoming_container.select('.dashboard-champ-content')
         print(f"Found {len(upcoming_sections)} upcoming sections")
+        
+        if not upcoming_sections:
+            print("Trying alternative selectors for upcoming sections")
+            upcoming_sections = upcoming_container.select('div[data-name="dashboard-champ-content"]')
+            print(f"Found {len(upcoming_sections)} upcoming sections with alternative selector")
         
         for section_index, section in enumerate(upcoming_sections):
             # Get league info
@@ -291,8 +420,23 @@ class XbetScraper:
             # Track current date for all matches in this section
             current_date = None
             
-            # Get all matches in this league
-            match_items = section.select('.c-events__item_col')
+            # Try multiple selectors for finding match items
+            match_items = []
+            selectors = [
+                '.c-events__item_col',
+                '.dashboard-champ-content__event-item',
+                '.c-events__item'
+            ]
+            
+            for selector in selectors:
+                match_items = section.select(selector)
+                if match_items:
+                    print(f"Found {len(match_items)} match items in {league_name} using selector: {selector}")
+                    break
+            
+            if not match_items:
+                print(f"No match items found in {league_name} after trying multiple selectors")
+                continue
             
             for item_index, item in enumerate(match_items):
                 # Check if this is a date header
@@ -302,8 +446,18 @@ class XbetScraper:
                     print(f"Found date: {current_date}")
                     continue
                 
-                # Get match element
-                match = item.select_one('.c-events__item_game')
+                # Get match element - try multiple selectors
+                match = None
+                match_selectors = [
+                    '.c-events__item_game',
+                    '.c-events-item'
+                ]
+                
+                for selector in match_selectors:
+                    match = item.select_one(selector)
+                    if match:
+                        break
+                
                 if not match:
                     continue
                 
@@ -407,11 +561,19 @@ class XbetScraper:
         league_headers = soup.select('.c-events__item_head')
         print(f"Found {len(league_headers)} league headers")
         
+        if not league_headers:
+            print("Trying alternative selectors for league headers")
+            league_headers = soup.select('.c-section-header, .c-events__item_head')
+            print(f"Found {len(league_headers)} league headers with alternative selector")
+        
         for i, header in enumerate(league_headers):
             # Skip duplicate leagues
             league_element = header.select_one('.c-events__liga')
             if not league_element:
-                continue
+                # Try alternative selectors
+                league_element = header.select_one('.c-section-header__title, .c-events__liga')
+                if not league_element:
+                    continue
             
             # Get information about this league
             league_name = league_element.text.strip()
