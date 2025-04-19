@@ -21,7 +21,7 @@ RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the code
+# Copy the rest of the application
 COPY . .
 
 # Make start script executable
@@ -30,7 +30,7 @@ RUN chmod +x start.sh
 # Create data directory
 RUN mkdir -p data
 
-# Set environment variable to allow Chrome to run in a container
+# Set environment variable for Chrome to run in container
 ENV PYTHONUNBUFFERED=1
 
 # Command to run the application
