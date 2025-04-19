@@ -1,13 +1,14 @@
+# Updated scraper.py with direct Chrome driver initialization
 import time
 import random
 import json
 import pandas as pd
 import os
+import subprocess
 from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -34,12 +35,52 @@ class XbetScraper:
         self.chrome_options.add_argument("--disable-backgrounding-occluded-windows")
         self.chrome_options.add_argument("--disable-backgrounding-suspended-windows")
         
-        # Initialize WebDriver with ChromeDriverManager
+        # For Render environment - detect Chrome location
+        try:
+            # Find Chrome binary location - works on both Render and local environments
+            chrome_paths = [
+                "/usr/bin/google-chrome",
+                "/usr/bin/google-chrome-stable",
+                "/usr/bin/chromium-browser",
+                "/usr/bin/chromium",
+                "/snap/bin/chromium"
+            ]
+            
+            chrome_path = None
+            for path in chrome_paths:
+                if os.path.exists(path):
+                    chrome_path = path
+                    break
+            
+            if chrome_path:
+                print(f"Found Chrome at: {chrome_path}")
+                self.chrome_options.binary_location = chrome_path
+            else:
+                print("Chrome executable not found in standard locations")
+        except Exception as e:
+            print(f"Error detecting Chrome location: {e}")
+        
+        # Initialize WebDriver directly
         print("Setting up Chrome WebDriver...")
-        service = Service(ChromeDriverManager().install())
-        self.driver = webdriver.Chrome(service=service, options=self.chrome_options)
-        self.wait = WebDriverWait(self.driver, 10)
-        print("WebDriver initialized successfully")
+        try:
+            self.driver = webdriver.Chrome(options=self.chrome_options)
+            self.wait = WebDriverWait(self.driver, 10)
+            print("WebDriver initialized successfully")
+        except Exception as e:
+            print(f"Error initializing Chrome WebDriver: {e}")
+            # Try with a more basic configuration if the first attempt fails
+            try:
+                print("Trying alternative WebDriver initialization...")
+                simple_options = Options()
+                simple_options.add_argument("--headless")
+                simple_options.add_argument("--no-sandbox")
+                simple_options.add_argument("--disable-dev-shm-usage")
+                self.driver = webdriver.Chrome(options=simple_options)
+                self.wait = WebDriverWait(self.driver, 10)
+                print("Alternative WebDriver initialization successful")
+            except Exception as e2:
+                print(f"Alternative WebDriver initialization also failed: {e2}")
+                raise
     
     def __del__(self):
         """Close the browser when done"""
