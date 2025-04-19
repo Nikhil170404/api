@@ -12,5 +12,8 @@ apt-get update && apt-get install -y google-chrome-stable
 # Set display port for Selenium
 export DISPLAY=:99
 
-# Start the application using the PORT provided by Render
-exec python app.py
+# Get the PORT from environment variable
+PORT=${PORT:-8000}
+
+# Start the application using Gunicorn
+exec gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 0 --worker-class uvicorn.workers.UvicornWorker
