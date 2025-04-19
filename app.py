@@ -1048,12 +1048,11 @@ async def health_check():
     """Health check endpoint for Render"""
     return {"status": "ok"}
 
-# This is the app instance that Gunicorn will use
-app = app  # This line makes the 'app' variable explicitly available at module level
-
-# Run the API server if executed directly (for local development)
+# Run the API server when executed directly
 if __name__ == "__main__":
     import os
+    # Get the port from environment variable (Render sets this)
     port = int(os.environ.get("PORT", 8000))
     print(f"Starting server on port {port}")
+    # Use direct uvicorn runner to avoid module imports
     uvicorn.run(app, host="0.0.0.0", port=port)
