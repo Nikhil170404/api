@@ -1048,7 +1048,10 @@ async def health_check():
     """Health check endpoint for Render"""
     return {"status": "ok"}
 
-# Run the API server if executed directly
+# This is the app instance that Gunicorn will use
+app = app  # This line makes the 'app' variable explicitly available at module level
+
+# Run the API server if executed directly (for local development)
 if __name__ == "__main__":
     import os
     port = int(os.environ.get("PORT", 8000))
