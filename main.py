@@ -9,6 +9,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from scraper import XbetScraper
 
@@ -18,7 +19,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Add CORS middleware
+# Add CORS middleware to allow cross-origin requests
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -46,61 +47,72 @@ def update_data():
     """Background task to update the data"""
     global scraper, data_store
     
-    if scraper is None:
-        scraper = XbetScraper()
-    
-    while True:
-        try:
-            with data_lock:
-                data_store["is_updating"] = True
-            
-            # Get the data from the scraper
-            html_content = scraper.get_page_content()
-            if html_content:
-                live_events = scraper.parse_live_events(html_content)
-                upcoming_events = scraper.parse_upcoming_events(html_content)
-                
-                # Update leagues every 5 minutes
-                current_time = time.time()
-                if not data_store["last_update"] or current_time - data_store["last_update"] > 300:
-                    leagues = scraper.get_all_leagues(html_content)
-                    with data_lock:
-                        data_store["leagues"] = leagues
-                
-                # Update the data store with thread safety
+    try:
+        if scraper is None:
+            scraper = XbetScraper()
+        
+        while True:
+            try:
                 with data_lock:
-                    data_store["live_events"] = live_events
-                    data_store["upcoming_events"] = upcoming_events
-                    data_store["last_update"] = current_time
-                    data_store["is_updating"] = False
+                    data_store["is_updating"] = True
                 
-                # Save the data to files for persistence
-                try:
-                    with open("data/live_events.json", "w", encoding="utf-8") as f:
-                        json.dump(live_events, f, ensure_ascii=False, indent=4)
+                # Get the data from the scraper
+                html_content = scraper.get_page_content()
+                if html_content:
+                    live_events = scraper.parse_live_events(html_content)
+                    upcoming_events = scraper.parse_upcoming_events(html_content)
                     
-                    with open("data/upcoming_events.json", "w", encoding="utf-8") as f:
-                        json.dump(upcoming_events, f, ensure_ascii=False, indent=4)
+                    # Update leagues every 10 minutes
+                    current_time = time.time()
+                    if not data_store["last_update"] or current_time - data_store.get("last_leagues_update", 0) > 600:
+                        leagues = scraper.get_all_leagues(html_content)
+                        with data_lock:
+                            data_store["leagues"] = leagues
+                            data_store["last_leagues_update"] = current_time
                     
-                    with open("data/leagues.json", "w", encoding="utf-8") as f:
-                        json.dump(data_store["leagues"], f, ensure_ascii=False, indent=4)
-                except Exception as e:
-                    print(f"Error saving data to files: {e}")
-            
-            # Sleep for 10 seconds before the next update
-            time.sleep(10)
-        except Exception as e:
-            print(f"Error updating data: {e}")
-            with data_lock:
-                data_store["is_updating"] = False
-            time.sleep(30)  # Wait longer if there was an error
-
-# Create the data directory if it doesn't exist
-if not os.path.exists("data"):
-    os.makedirs("data")
+                    # Update the data store with thread safety
+                    with data_lock:
+                        data_store["live_events"] = live_events
+                        data_store["upcoming_events"] = upcoming_events
+                        data_store["last_update"] = current_time
+                        data_store["is_updating"] = False
+                    
+                    # Save the data to files for persistence
+                    try:
+                        os.makedirs("data", exist_ok=True)
+                        
+                        with open("data/live_events.json", "w", encoding="utf-8") as f:
+                            json.dump(live_events, f, ensure_ascii=False, indent=2)
+                        
+                        with open("data/upcoming_events.json", "w", encoding="utf-8") as f:
+                            json.dump(upcoming_events, f, ensure_ascii=False, indent=2)
+                        
+                        with open("data/leagues.json", "w", encoding="utf-8") as f:
+                            json.dump(data_store["leagues"], f, ensure_ascii=False, indent=2)
+                            
+                        print(f"Data updated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                    except Exception as e:
+                        print(f"Error saving data to files: {e}")
+                
+                # Sleep for 20 seconds on Render free tier to avoid excessive resource use
+                time.sleep(20)
+            except Exception as e:
+                print(f"Error in update loop: {e}")
+                with data_lock:
+                    data_store["is_updating"] = False
+                time.sleep(60)  # Wait longer if there was an error
+    except Exception as e:
+        print(f"Fatal error in update thread: {e}")
+        if scraper:
+            try:
+                scraper.__del__()
+            except:
+                pass
 
 # Load any existing data from files
 try:
+    os.makedirs("data", exist_ok=True)
+    
     if os.path.exists("data/live_events.json"):
         with open("data/live_events.json", "r", encoding="utf-8") as f:
             data_store["live_events"] = json.load(f)
@@ -242,15 +254,17 @@ def get_upcoming_events_by_league(league_id: str):
 @app.get("/api/match/{match_id}")
 def get_match_by_id(match_id: str):
     """Get detailed information for a specific match"""
+    match_id = match_id.lower()
+    
     with data_lock:
         # Look in live events first
         for event in data_store["live_events"]:
-            if event.get("match_id", "").replace(" ", "_").lower() == match_id.lower():
+            if event.get("match_id", "").lower() == match_id or event.get("match_id", "").replace(" ", "_").lower() == match_id:
                 return event
         
         # Then look in upcoming events
         for event in data_store["upcoming_events"]:
-            if event.get("match_id", "").replace(" ", "_").lower() == match_id.lower():
+            if event.get("match_id", "").lower() == match_id or event.get("match_id", "").replace(" ", "_").lower() == match_id:
                 return event
     
     raise HTTPException(status_code=404, detail="Match not found")
@@ -258,8 +272,18 @@ def get_match_by_id(match_id: str):
 @app.get("/api/refresh", status_code=202)
 def trigger_refresh(background_tasks: BackgroundTasks):
     """Manually trigger a data refresh"""
+    global scraper
+    
     if data_store["is_updating"]:
         return {"status": "already_updating", "message": "Data is already being updated"}
+    
+    # Restart the scraper if it exists
+    if scraper:
+        try:
+            scraper.__del__()
+        except:
+            pass
+        scraper = None
     
     # Use background task to avoid blocking the request
     background_tasks.add_task(update_data)
@@ -281,6 +305,12 @@ def get_sports():
                 sports.add(event["sport"])
     
     return {"count": len(sports), "sports": sorted(list(sports))}
+
+# Webhook for monitoring services to ping to keep the service alive
+@app.get("/ping")
+def ping():
+    """Endpoint for monitoring services to ping to keep the service alive"""
+    return {"status": "alive", "timestamp": datetime.now().isoformat()}
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
