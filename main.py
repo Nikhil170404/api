@@ -2,6 +2,9 @@ import json
 import os
 import threading
 import time
+import sys
+import platform
+import subprocess
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
@@ -12,6 +15,12 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from scraper import XbetScraper
+
+# Try to import psutil for system monitoring
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 app = FastAPI(
     title="1xBet Odds API",
@@ -34,6 +43,7 @@ data_store = {
     "upcoming_events": [],
     "leagues": [],
     "last_update": None,
+    "last_leagues_update": None,
     "is_updating": False
 }
 
@@ -64,7 +74,7 @@ def update_data():
                     
                     # Update leagues every 10 minutes
                     current_time = time.time()
-                    if not data_store["last_update"] or current_time - data_store.get("last_leagues_update", 0) > 600:
+                    if not data_store["last_leagues_update"] or current_time - data_store.get("last_leagues_update", 0) > 600:
                         leagues = scraper.get_all_leagues(html_content)
                         with data_lock:
                             data_store["leagues"] = leagues
@@ -147,7 +157,8 @@ def read_root():
             "/api/live/{league_id}",
             "/api/upcoming/{league_id}",
             "/api/match/{match_id}",
-            "/api/status"
+            "/api/status",
+            "/api/debug"
         ]
     }
 
@@ -162,6 +173,64 @@ def get_status():
             "upcoming_events_count": len(data_store["upcoming_events"]),
             "leagues_count": len(data_store["leagues"])
         }
+
+@app.get("/api/debug")
+def get_debug_info():
+    """Get diagnostic information about the scraper status"""
+    global scraper
+    
+    debug_info = {
+        "status": "OK",
+        "timestamp": datetime.now().isoformat(),
+        "environment": {}
+    }
+    
+    # Environment info
+    try:
+        chrome_version = subprocess.run(["google-chrome", "--version"], 
+                                        capture_output=True, text=True)
+        debug_info["environment"]["chrome_version"] = chrome_version.stdout.strip()
+    except Exception as e:
+        debug_info["environment"]["chrome_version"] = f"Error detecting Chrome version: {str(e)}"
+    
+    # Check for debug files
+    debug_info["debug_files"] = {
+        "page_screenshot": os.path.exists("debug/page_screenshot.png"),
+        "debug_page": os.path.exists("debug/debug_page.html")
+    }
+    
+    # Try to get a minimal test page
+    if scraper:
+        try:
+            test_html = scraper.get_page_content("https://httpbin.org/ip")
+            debug_info["test_page"] = {
+                "success": test_html is not None,
+                "length": len(test_html) if test_html else 0
+            }
+        except Exception as e:
+            debug_info["test_page"] = {
+                "success": False,
+                "error": str(e)
+            }
+    
+    # Get some system info
+    debug_info["system"] = {
+        "python_version": sys.version,
+        "platform": platform.platform(),
+        "memory": psutil.virtual_memory()._asdict() if psutil else "Not available"
+    }
+    
+    # Data store info
+    with data_lock:
+        debug_info["data_store"] = {
+            "last_update": datetime.fromtimestamp(data_store["last_update"]).strftime("%Y-%m-%d %H:%M:%S") if data_store["last_update"] else None,
+            "is_updating": data_store["is_updating"],
+            "live_events_count": len(data_store["live_events"]),
+            "upcoming_events_count": len(data_store["upcoming_events"]),
+            "leagues_count": len(data_store["leagues"])
+        }
+    
+    return debug_info
 
 @app.get("/api/live")
 def get_live_events(
@@ -311,6 +380,15 @@ def get_sports():
 def ping():
     """Endpoint for monitoring services to ping to keep the service alive"""
     return {"status": "alive", "timestamp": datetime.now().isoformat()}
+
+@app.get("/debug/download")
+def download_debug_file():
+    """Download the debug HTML file"""
+    if os.path.exists("debug/debug_page.html"):
+        with open("debug/debug_page.html", "r", encoding="utf-8") as f:
+            content = f.read()
+        return JSONResponse(content={"file_content": content})
+    return JSONResponse(content={"error": "Debug file not found"}, status_code=404)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
